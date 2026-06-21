@@ -1,168 +1,667 @@
-import cv2
-import numpy as np
+# utils/losses.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def generate_edge_gt(label: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+# ============================================================
+# 1. 基础工具
+# ============================================================
+def _resize_like(logits, target_hw):
+    if logits.shape[-2:] != target_hw:
+        logits = F.interpolate(
+            logits,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False
+        )
+    return logits
+
+
+def _valid_mask_from_label(label, ignore_index=255):
+    return (label != ignore_index).unsqueeze(1).float()
+
+
+def downsample_label_nearest(label, size):
     """
-    label: (B, H, W) long tensor, 0..num_classes-1 or 255
-    returns: (B, 1, H, W) float tensor, boundary map
+    label: [B, H, W]
+    size:  (h, w)
+
+    return:
+        [B, h, w]
+    """
+    label_small = F.interpolate(
+        label.unsqueeze(1).float(),
+        size=size,
+        mode="nearest"
+    ).squeeze(1).long()
+
+    return label_small
+
+
+# ============================================================
+# 2. 多类 Dice Loss
+# ============================================================
+def multiclass_dice_loss(
+    logits,
+    target,
+    num_classes,
+    ignore_index=255,
+    eps=1e-6
+):
+    logits = _resize_like(logits, target.shape[-2:])
+
+    valid = target != ignore_index
+
+    target_safe = target.clone()
+    target_safe[~valid] = 0
+
+    prob = torch.softmax(logits, dim=1)
+
+    one_hot = F.one_hot(
+        target_safe.long(),
+        num_classes=num_classes
+    ).permute(0, 3, 1, 2).float()
+
+    valid = valid.unsqueeze(1).float()
+
+    prob = prob * valid
+    one_hot = one_hot * valid
+
+    dims = (0, 2, 3)
+
+    intersection = torch.sum(prob * one_hot, dim=dims)
+    cardinality = torch.sum(prob + one_hot, dim=dims)
+
+    dice = (2.0 * intersection + eps) / (cardinality + eps)
+
+    return 1.0 - dice.mean()
+
+
+# ============================================================
+# 3. 二分类 masked BCE / Dice
+# ============================================================
+def masked_bce_with_logits(
+    logits,
+    target,
+    valid_mask=None,
+    pos_weight=None,
+    eps=1e-6
+):
+    """
+    logits: [B, K, H, W]
+    target: [B, K, H, W]
+    valid_mask: [B, 1, H, W] or [B, K, H, W]
+    """
+    loss = F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction="none",
+        pos_weight=pos_weight
+    )
+
+    if valid_mask is not None:
+        if valid_mask.shape[1] == 1 and logits.shape[1] != 1:
+            valid_mask = valid_mask.expand_as(logits)
+
+        loss = loss * valid_mask
+        denom = valid_mask.sum().clamp_min(eps)
+        return loss.sum() / denom
+
+    return loss.mean()
+
+
+def binary_dice_loss_with_logits(
+    logits,
+    target,
+    valid_mask=None,
+    eps=1e-6
+):
+    prob = torch.sigmoid(logits)
+
+    if valid_mask is not None:
+        if valid_mask.shape[1] == 1 and logits.shape[1] != 1:
+            valid_mask = valid_mask.expand_as(logits)
+
+        prob = prob * valid_mask
+        target = target * valid_mask
+
+    dims = (0, 2, 3)
+
+    intersection = torch.sum(prob * target, dim=dims)
+    union = torch.sum(prob + target, dim=dims)
+
+    dice = (2.0 * intersection + eps) / (union + eps)
+
+    return 1.0 - dice.mean()
+
+
+# ============================================================
+# 4. 普通边界 GT
+# ============================================================
+def generate_edge_gt(label, ignore_index=255):
+    """
+    label: [B, H, W]
+    return: [B, 1, H, W]
     """
     B, H, W = label.shape
-    device = label.device
-    # 忽略255：将其设为0（背景），但在后续会通过mask过滤
-    valid_mask = (label != 255).float()  # (B, H, W)
-    label_safe = torch.where(label == 255, torch.zeros_like(label), label)  # 255 -> 0
 
-    # 使用 max pooling 实现膨胀，-max pooling 实现腐蚀（对类别标签需小心）
-    # 更稳健：将标签转为 one-hot 形式，对每个类别分别做膨胀/腐蚀再合并
-    # 但为简单，用形态学近似：对每个像素周围区域判断是否与中心不同。
-    # 我们直接用标签值与邻居比较生成边界，这比形态学快且容易忽略255。
+    edge = torch.zeros(
+        (B, H, W),
+        dtype=torch.float32,
+        device=label.device
+    )
 
-    # 用绝对差值生成边界：如果像素与4邻域有类别不同，则为边界
-    # 4邻域差异
-    diff_right = (label_safe[:, :, :-1] != label_safe[:, :, 1:]).float()
-    diff_down = (label_safe[:, :-1, :] != label_safe[:, 1:, :]).float()
-    edge = torch.zeros_like(label_safe, dtype=torch.float32)
-    edge[:, :, :-1] = edge[:, :, :-1] + diff_right
-    edge[:, :, 1:] = edge[:, :, 1:] + diff_right
-    edge[:, :-1, :] = edge[:, :-1, :] + diff_down
-    edge[:, 1:, :] = edge[:, 1:, :] + diff_down
-    edge = (edge > 0).float()   # 边界为1，内部为0
+    valid = label != ignore_index
 
-    # 排除255像素
-    edge = edge * valid_mask
-    return edge.unsqueeze(1)   # (B, 1, H, W)
+    # 横向边界
+    diff_h = (
+        (label[:, :, 1:] != label[:, :, :-1]) &
+        valid[:, :, 1:] &
+        valid[:, :, :-1]
+    )
+
+    edge[:, :, 1:] = torch.maximum(
+        edge[:, :, 1:],
+        diff_h.float()
+    )
+    edge[:, :, :-1] = torch.maximum(
+        edge[:, :, :-1],
+        diff_h.float()
+    )
+
+    # 纵向边界
+    diff_v = (
+        (label[:, 1:, :] != label[:, :-1, :]) &
+        valid[:, 1:, :] &
+        valid[:, :-1, :]
+    )
+
+    edge[:, 1:, :] = torch.maximum(
+        edge[:, 1:, :],
+        diff_v.float()
+    )
+    edge[:, :-1, :] = torch.maximum(
+        edge[:, :-1, :],
+        diff_v.float()
+    )
+
+    return edge.unsqueeze(1)
 
 
-def generate_conn_gt(label: torch.Tensor) -> tuple:
+# ============================================================
+# 5. 通用 Class-aware mstc GT
+# ============================================================
+def _any_semantic_boundary(
+    label,
+    offsets,
+    ignore_index=255
+):
     """
-    显存优化版的 4-连接和 8-连接真值生成
+    任意语义类别之间的边界。
+
+    label: [B, H, W]
+    return: [B, H, W]
+    """
+    B, H, W = label.shape
+
+    out = torch.zeros(
+        (B, H, W),
+        dtype=torch.float32,
+        device=label.device
+    )
+
+    valid = label != ignore_index
+
+    for dy, dx in offsets:
+        y1_start = max(0, dy)
+        y1_end = H + min(0, dy)
+
+        x1_start = max(0, dx)
+        x1_end = W + min(0, dx)
+
+        y2_start = max(0, -dy)
+        y2_end = H - max(0, dy)
+
+        x2_start = max(0, -dx)
+        x2_end = W - max(0, dx)
+
+        l1 = label[:, y1_start:y1_end, x1_start:x1_end]
+        l2 = label[:, y2_start:y2_end, x2_start:x2_end]
+
+        v1 = valid[:, y1_start:y1_end, x1_start:x1_end]
+        v2 = valid[:, y2_start:y2_end, x2_start:x2_end]
+
+        diff = (l1 != l2) & v1 & v2
+
+        out[:, y1_start:y1_end, x1_start:x1_end] = torch.maximum(
+            out[:, y1_start:y1_end, x1_start:x1_end],
+            diff.float()
+        )
+
+        out[:, y2_start:y2_end, x2_start:x2_end] = torch.maximum(
+            out[:, y2_start:y2_end, x2_start:x2_end],
+            diff.float()
+        )
+
+    return out
+
+
+def _pair_boundary(
+    label,
+    class_a_set,
+    class_b_set,
+    offsets,
+    ignore_index=255
+):
+    """
+    指定两个类别集合之间的边界。
+
+    label: [B, H, W]
+    class_a_set: list[int]
+    class_b_set: list[int]
+    return: [B, H, W]
+    """
+    B, H, W = label.shape
+
+    out = torch.zeros(
+        (B, H, W),
+        dtype=torch.float32,
+        device=label.device
+    )
+
+    valid = label != ignore_index
+
+    a_mask = torch.zeros_like(label, dtype=torch.bool)
+    b_mask = torch.zeros_like(label, dtype=torch.bool)
+
+    for c in class_a_set:
+        a_mask |= (label == int(c))
+
+    for c in class_b_set:
+        b_mask |= (label == int(c))
+
+    for dy, dx in offsets:
+        y1_start = max(0, dy)
+        y1_end = H + min(0, dy)
+
+        x1_start = max(0, dx)
+        x1_end = W + min(0, dx)
+
+        y2_start = max(0, -dy)
+        y2_end = H - max(0, dy)
+
+        x2_start = max(0, -dx)
+        x2_end = W - max(0, dx)
+
+        l1_a = a_mask[:, y1_start:y1_end, x1_start:x1_end]
+        l1_b = b_mask[:, y1_start:y1_end, x1_start:x1_end]
+
+        l2_a = a_mask[:, y2_start:y2_end, x2_start:x2_end]
+        l2_b = b_mask[:, y2_start:y2_end, x2_start:x2_end]
+
+        v1 = valid[:, y1_start:y1_end, x1_start:x1_end]
+        v2 = valid[:, y2_start:y2_end, x2_start:x2_end]
+
+        pair_diff = (
+            ((l1_a & l2_b) | (l1_b & l2_a)) &
+            v1 &
+            v2
+        )
+
+        out[:, y1_start:y1_end, x1_start:x1_end] = torch.maximum(
+            out[:, y1_start:y1_end, x1_start:x1_end],
+            pair_diff.float()
+        )
+
+        out[:, y2_start:y2_end, x2_start:x2_end] = torch.maximum(
+            out[:, y2_start:y2_end, x2_start:x2_end],
+            pair_diff.float()
+        )
+
+    return out
+
+
+def generate_class_aware_conn_gt(
+    label,
+    topology_pairs,
+    ignore_index=255
+):
+    """
+    根据 topology_pairs 动态生成 mstc GT。
+
+    label:
+        [B, H, W] or [H, W]
+
+    topology_pairs:
+        [
+            ("any_boundary", None, None),
+            ("low_tree", [2], [3]),
+            ...
+        ]
+
+    return:
+        conn_gt: [B, K, H, W]
     """
     if label.dim() == 2:
         label = label.unsqueeze(0)
-    B, H, W = label.shape
 
-    # 使用 bool 类型初始化，极大节省显存
-    GT4 = torch.zeros_like(label, dtype=torch.bool)
+    label = label.long()
 
-    # 判断邻居是否相同 (仍为 bool)
-    right = (label[:, :, :-1] == label[:, :, 1:])
-    down = (label[:, :-1, :] == label[:, 1:, :])
+    offsets_8 = [
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (1, -1),
+    ]
 
-    # 布尔或运算（只要某方向有相同类别的像素，即为 True）
-    GT4[:, :, :-1] |= right
-    GT4[:, :, 1:] |= right
-    GT4[:, :-1, :] |= down
-    GT4[:, 1:, :] |= down
+    maps = []
 
-    GT8 = GT4.clone()
+    for name, class_a_set, class_b_set in topology_pairs:
+        if class_a_set is None or class_b_set is None:
+            boundary = _any_semantic_boundary(
+                label,
+                offsets=offsets_8,
+                ignore_index=ignore_index
+            )
+        else:
+            boundary = _pair_boundary(
+                label,
+                class_a_set=class_a_set,
+                class_b_set=class_b_set,
+                offsets=offsets_8,
+                ignore_index=ignore_index
+            )
 
-    diag1 = (label[:, :-1, :-1] == label[:, 1:, 1:])  # 右下
-    diag2 = (label[:, :-1, 1:] == label[:, 1:, :-1])  # 左下
+        maps.append(boundary)
 
-    GT8[:, :-1, :-1] |= diag1
-    GT8[:, 1:, 1:] |= diag1
-    GT8[:, :-1, 1:] |= diag2
-    GT8[:, 1:, :-1] |= diag2
+    if len(maps) == 0:
+        raise RuntimeError("topology_pairs 为空，无法生成 mstc GT。")
 
-    # 最后一步才转换为 Float，喂给 BCE Loss
-    return GT4.float(), GT8.float()
+    conn_gt = torch.stack(maps, dim=1)
+
+    return conn_gt.float()
 
 
-def dice_loss(pred: torch.Tensor, target: torch.Tensor, num_classes: int, ignore_index: int = 255,
-              smooth: float = 1e-6) -> torch.Tensor:
+def generate_conn_gt(
+    label,
+    topology_pairs=None,
+    num_classes=None,
+    ignore_index=255
+):
     """
-    支持 ignore_index 的多类别 Dice 损失
+    兼容旧接口。
+
+    新版本返回：
+        conn_gt: [B, K, H, W]
     """
-    # 1. 经过 Softmax 得到预测概率
-    pred_soft = F.softmax(pred, dim=1)
+    if topology_pairs is None:
+        topology_pairs = [
+            ("any_boundary", None, None),
+        ]
 
-    # 2. 创建一个掩码，标记出有效的像素 (非 255 的地方为 True)
-    valid_mask = (target != ignore_index).unsqueeze(1).float()  # (B, 1, H, W)
-
-    # 3. 将 target 中所有的 255 截断成 0 (或任何合法值)
-    # 这样 F.one_hot 就绝对不会再报越界错误了
-    target_safe = torch.clamp(target, min=0, max=num_classes - 1)
-
-    # 生成 One-Hot 编码
-    target_one_hot = F.one_hot(target_safe, num_classes).permute(0, 3, 1, 2).float()  # (B, C, H, W)
-
-    # 4. 将 target 和 pred 中属于忽略区域的像素全部清零！
-    # 这样它们既不会增加 intersection，也不会增加 union
-    target_one_hot = target_one_hot * valid_mask
-    pred_soft = pred_soft * valid_mask
-
-    # 5. 计算交集和并集 (在空间维度上求和)
-    intersection = (pred_soft * target_one_hot).sum(dim=(2, 3))  # (B, C)
-    union = pred_soft.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
-
-    # 6. 计算 Dice 系数
-    dice = (2. * intersection + smooth) / (union + smooth)
-
-    return 1. - dice.mean()
+    return generate_class_aware_conn_gt(
+        label=label,
+        topology_pairs=topology_pairs,
+        ignore_index=ignore_index
+    )
 
 
+
+
+# ============================================================
+# 7. TopoMambaLoss
+# ============================================================
 class TopoMambaLoss(nn.Module):
-    """
-    TopoMamba 总损失
-    包含:
-        - 交叉熵损失 (主分割)
-        - Dice 损失
-        - LBS 边界损失 (4 个辅助头)
-        - DCPM 连接性损失
-    """
-
-    def __init__(self, num_classes: int, lambda_edge: float = 0.2, lambda_conn: float = 0.1):
+    def __init__(
+        self,
+        num_classes,
+        lambda_edge=0.2,
+        lambda_conn=0.1,
+        ignore_index=255,
+        class_weights=None,
+        topology_pairs=None,
+        conn_scale_weights=None
+    ):
         super().__init__()
+
         self.num_classes = num_classes
         self.lambda_edge = lambda_edge
         self.lambda_conn = lambda_conn
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=255)
+        self.ignore_index = ignore_index
 
-    def forward(self, seg_logits: torch.Tensor, mask: torch.Tensor,
-                conn_logits: torch.Tensor, edge_preds: list) -> dict:
+        if topology_pairs is None:
+            topology_pairs = [
+                ("any_boundary", None, None),
+            ]
 
-        # 🌟 核心修复 1：将预测的 seg_logits 强行上采样到真实标签 mask 的尺寸
-        if seg_logits.shape[2:] != mask.shape[1:]:
-            seg_logits = F.interpolate(seg_logits, size=mask.shape[1:], mode='bilinear', align_corners=False)
+        self.topology_pairs = topology_pairs
 
-        # 🌟 核心修复 2：将预测的 conn_logits 也对齐到 mask 的尺寸
-        if conn_logits.shape[2:] != mask.shape[1:]:
-            conn_logits = F.interpolate(conn_logits, size=mask.shape[1:], mode='bilinear', align_corners=False)
+        if conn_scale_weights is None:
+            conn_scale_weights = [0.4, 0.3, 0.2, 0.1]
 
-        # 现在的 H, W 已经和 mask 完美一致了（都是 512）
-        B, C, H, W = seg_logits.shape
+        self.conn_scale_weights = conn_scale_weights
 
-        # 1. 交叉熵损失 (现在绝不会报错了)
-        ce_loss = self.ce_loss(seg_logits, mask)
+        if class_weights is not None:
+            if len(class_weights) != num_classes:
+                raise ValueError(
+                    f"class_weights 长度必须等于 num_classes, "
+                    f"当前 len(class_weights)={len(class_weights)}, "
+                    f"num_classes={num_classes}"
+                )
 
-        # 2. Dice 损失
-        dice = dice_loss(seg_logits, mask, self.num_classes)
+            class_weights = torch.tensor(
+                class_weights,
+                dtype=torch.float32
+            )
 
-        # 3. LBS 边界损失
-        edge_gt = generate_edge_gt(mask, kernel_size=3)  # (B, 1, 512, 512)
-        lbs_loss = 0.
-        for pred_edge in edge_preds:
-            # 你这里之前写得很好，已经自带了 F.interpolate，所以辅助头没报错
-            pred_up = F.interpolate(pred_edge, size=(H, W), mode='bilinear', align_corners=False)
-            lbs_loss += F.binary_cross_entropy_with_logits(pred_up, edge_gt)
-        lbs_loss = lbs_loss / len(edge_preds)
+            self.register_buffer("class_weights", class_weights)
+        else:
+            self.class_weights = None
 
-        # 4. 连接性损失
-        gt4, gt8 = generate_conn_gt(mask)  # (B, 512, 512)
-        conn_loss = F.binary_cross_entropy_with_logits(conn_logits[:, 0, :, :], gt4) + \
-                    F.binary_cross_entropy_with_logits(conn_logits[:, 1, :, :], gt8)
+        # 主分割 CE Loss
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=self.class_weights,
+            ignore_index=ignore_index
+        )
 
-        # 5. 总损失
-        total_loss = ce_loss + dice + self.lambda_edge * lbs_loss + self.lambda_conn * conn_loss
+    def _single_conn_loss(self, conn_logit, target, device):
+        """
+        单尺度 mstc loss。
+
+        conn_logit:
+            [B, K, h, w]
+        target:
+            [B, H, W]
+        """
+        if conn_logit is None:
+            return torch.tensor(0.0, device=device)
+
+        target_i = downsample_label_nearest(
+            target,
+            size=conn_logit.shape[-2:]
+        )
+
+        conn_gt_i = generate_class_aware_conn_gt(
+            label=target_i,
+            topology_pairs=self.topology_pairs,
+            ignore_index=self.ignore_index
+        )
+
+        valid_mask_i = _valid_mask_from_label(
+            target_i,
+            ignore_index=self.ignore_index
+        )
+
+        if conn_logit.shape[1] != conn_gt_i.shape[1]:
+            raise RuntimeError(
+                f"conn_logits 通道数和 conn_gt 不一致: "
+                f"conn_logits={tuple(conn_logit.shape)}, "
+                f"conn_gt={tuple(conn_gt_i.shape)}. "
+                f"mstc 输出通道数应等于 len(topology_pairs)={len(self.topology_pairs)}。"
+            )
+
+        bce_conn = masked_bce_with_logits(
+            conn_logit,
+            conn_gt_i,
+            valid_mask=valid_mask_i
+        )
+
+        dice_conn = binary_dice_loss_with_logits(
+            conn_logit,
+            conn_gt_i,
+            valid_mask=valid_mask_i
+        )
+
+        return bce_conn + dice_conn
+
+    def _multi_scale_conn_loss(self, conn_logits, target, device):
+        if conn_logits is None:
+            return torch.tensor(0.0, device=device)
+
+        if isinstance(conn_logits, (list, tuple)):
+            num_scales = len(conn_logits)
+
+            if num_scales == 0:
+                return torch.tensor(0.0, device=device)
+
+            if len(self.conn_scale_weights) == num_scales:
+                scale_weights = self.conn_scale_weights
+            else:
+                scale_weights = [1.0 / num_scales for _ in range(num_scales)]
+
+            losses = []
+
+            for w, conn_logit in zip(scale_weights, conn_logits):
+                losses.append(
+                    float(w) * self._single_conn_loss(
+                        conn_logit=conn_logit,
+                        target=target,
+                        device=device
+                    )
+                )
+
+            return sum(losses)
+
+        return self._single_conn_loss(
+            conn_logit=conn_logits,
+            target=target,
+            device=device
+        )
+
+    def forward(
+        self,
+        seg_logits,
+        target,
+        conn_logits=None,
+        edge_preds=None
+    ):
+        target = target.long()
+        device = seg_logits.device
+
+        # ----------------------------------------------------
+        # 1. Segmentation Loss: CE + Dice
+        # ----------------------------------------------------
+        seg_logits = _resize_like(
+            seg_logits,
+            target.shape[-2:]
+        )
+
+        ce = self.ce_loss(
+            seg_logits,
+            target
+        )
+
+        dice = multiclass_dice_loss(
+            logits=seg_logits,
+            target=target,
+            num_classes=self.num_classes,
+            ignore_index=self.ignore_index
+        )
+
+        seg_loss = ce + dice
+
+        # ----------------------------------------------------
+        # 2. LBS Edge Loss
+        # ----------------------------------------------------
+        edge_loss = torch.tensor(0.0, device=device)
+
+        if edge_preds is not None and self.lambda_edge > 0:
+            edge_gt = generate_edge_gt(
+                target,
+                ignore_index=self.ignore_index
+            )
+
+            valid_mask = _valid_mask_from_label(
+                target,
+                ignore_index=self.ignore_index
+            )
+
+            if torch.is_tensor(edge_preds):
+                edge_preds_list = [edge_preds]
+            else:
+                edge_preds_list = list(edge_preds)
+
+            edge_losses = []
+
+            for edge_logit in edge_preds_list:
+                if edge_logit is None:
+                    continue
+
+                if edge_logit.dim() == 3:
+                    edge_logit = edge_logit.unsqueeze(1)
+
+                edge_logit = _resize_like(
+                    edge_logit,
+                    target.shape[-2:]
+                )
+
+                bce_edge = masked_bce_with_logits(
+                    edge_logit,
+                    edge_gt,
+                    valid_mask=valid_mask
+                )
+
+                dice_edge = binary_dice_loss_with_logits(
+                    edge_logit,
+                    edge_gt,
+                    valid_mask=valid_mask
+                )
+
+                edge_losses.append(bce_edge + dice_edge)
+
+            if len(edge_losses) > 0:
+                edge_loss = sum(edge_losses) / len(edge_losses)
+
+        # ----------------------------------------------------
+        # 3. Multi-scale mstc
+        # Loss
+        # ----------------------------------------------------
+        conn_loss = torch.tensor(0.0, device=device)
+
+        if conn_logits is not None and self.lambda_conn > 0:
+            conn_loss = self._multi_scale_conn_loss(
+                conn_logits=conn_logits,
+                target=target,
+                device=device
+            )
+
+        # ----------------------------------------------------
+        # 4. Total Loss
+        # ----------------------------------------------------
+        total_loss = (
+            seg_loss
+            + self.lambda_edge * edge_loss
+            + self.lambda_conn * conn_loss
+        )
 
         return {
-            'total_loss': total_loss,
-            'ce_loss': ce_loss.item(),
-            'dice_loss': dice.item(),
-            'lbs_loss': lbs_loss.item(),
-            'conn_loss': conn_loss.item(),
+            "total_loss": total_loss,
+            "seg_loss": seg_loss.detach(),
+            "ce_loss": ce.detach(),
+            "dice_loss": dice.detach(),
+            "edge_loss": edge_loss.detach(),
+            "lbs_loss": edge_loss.detach(),
+            "conn_loss": conn_loss.detach(),
         }
