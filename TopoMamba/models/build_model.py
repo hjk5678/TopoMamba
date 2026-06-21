@@ -1,10 +1,10 @@
+import torch
 import torch.nn as nn
-import torchvision.models as tv_models
+
 from models.encoder.resnet0 import ResNet0
-from models.encoder.tpdb import build_encoder_stages
 from models.encoder.ssa_m import SSA_M
+from models.encoder.tpdb import build_encoder_stages
 from models.decoder.decoder import Decoder
-from models.mstc import MSTC
 
 from models.boundary_guidance import (
     BoundaryPriorExtractor,
@@ -12,47 +12,75 @@ from models.boundary_guidance import (
 )
 
 
+# ============================================================
+# Connectivity / Topology Head
+# ============================================================
+# 你的工程里目前使用的是 MSTC。
+# 为了兼容，如果没有 MSTC，则尝试导入 DCPM。
+# ============================================================
+try:
+    from models.mstc import MSTC as ConnHead
+    _CONN_HEAD_NAME = "MSTC"
+except Exception:
+    from models.dcpm import DCPM as ConnHead
+    _CONN_HEAD_NAME = "DCPM"
+
+
+def build_conn_head(in_channels, out_channels):
+    """
+    兼容 MSTC / DCPM 的构造函数。
+    正常情况下是：
+        Head(in_channels=..., out_channels=...)
+    """
+    try:
+        return ConnHead(
+            in_channels=in_channels,
+            out_channels=out_channels
+        )
+    except TypeError:
+        return ConnHead(
+            in_channels,
+            out_channels
+        )
+
+
 class TopoMamba(nn.Module):
     """
-    TopoMamba v5: no MSSE + BGSM + Multi-scale mstc.
+    TopoMamba with TPDB dual-branch encoder.
 
-    当前版本：
-        1. 完全删除 MSSE；
-        2. 保留 Multi-scale mstc；
-        3. 新增 BoundaryPriorExtractor；
-        4. 新增 BGSM，即 Boundary-Guided State Modulation；
-        5. 在每个 TPDB stage 输入前使用 BGSM 调制特征；
-        6. 让边界先验参与 encoder 主干建模；
-        7. mstc 继续在 SSA-M 输出后做多尺度连通性监督；
-        8. decoder 只负责 seg_logits 和 edge_preds。
+    当前版本结构：
 
-    主体流程：
-        Input
-          ├── BoundaryPriorExtractor -> boundary_prior
-          ↓
-        ResNet0 shallow branch -> f0
-        Stem -> f1
-          ↓
-        BGSM1(f1, boundary_prior) -> TPDB Stage1
-          ↓
-        BGSM2(f2, boundary_prior) -> TPDB Stage2
-          ↓
-        BGSM3(f3, boundary_prior) -> TPDB Stage3
-          ↓
-        BGSM4(f4, boundary_prior) -> TPDB Stage4
-          ↓
-        SSA-M -> g0/g1/g2/g3
-          ↓
-        Multi-scale mstc -> conn_logits
-          ↓
-        Decoder -> seg_logits + edge_preds
+        Input image
+            ├── ResNet0 high-resolution branch
+            │       f0:      [B, 32, H,   W]
+            │       f0_down: [B, 32, H/2, W/2]
+            │
+            └── TPDB encoder
+                    stem: [B, 64, H/4, W/4]
+                    stage1: TPDB(CNN branch + VSS branch + DGF)
+                    merge1
+                    stage2: TPDB(CNN branch + VSS branch + DGF)
+                    merge2
+                    stage3: TPDB(CNN branch + VSS branch + DGF)
+                    merge3
+                    stage4: TPDB(CNN branch + VSS branch + DGF)
 
-    输出:
-        {
-            "seg_logits":  [B, num_classes, H, W],
-            "edge_preds":  list of 4 tensors,
-            "conn_logits": list of 4 tensors
-        }
+    TPDB 内部：
+        CNN branch:
+            ResNet18-style BasicBlock
+            由 models/encoder/tpdb.py 中的 build_encoder_stages 加载 ResNet18 ImageNet 预训练权重。
+
+        VMamba/VSS branch:
+            official VSSBlock
+            当前默认随机初始化，后续可以再写 key mapping 加载 VMamba checkpoint。
+
+        Fusion:
+            DGF 动态门控融合。
+
+    forward 输出：
+        outputs["seg_logits"]:  [B, num_classes, H, W]
+        outputs["edge_preds"]:  list
+        outputs["conn_logits"]: list
     """
 
     def __init__(
@@ -60,27 +88,57 @@ class TopoMamba(nn.Module):
         num_classes=6,
         dims=(64, 128, 256, 512),
         depths=(2, 2, 4, 2),
-        topology_pairs=None
+        topology_pairs=None,
+
+        # -------------------------------------------------
+        # 兼容旧 train.py。
+        # 当前版本不使用 MSSE，但保留参数防止旧脚本报错。
+        # -------------------------------------------------
+        use_msse=None,
+
+        # -------------------------------------------------
+        # TPDB settings
+        # -------------------------------------------------
+        num_cnn_blocks=2,
+        num_vss_blocks=1,
+        vss_use_checkpoint=False,
+        drop_path_rate=0.1,
+
+        # -------------------------------------------------
+        # CNN branch pretrained settings
+        # -------------------------------------------------
+        cnn_pretrained=True,
+        cnn_pretrained_path=None,
+
+        # -------------------------------------------------
+        # Boundary guidance
+        # -------------------------------------------------
+        use_bgsm=True,
+
+        # -------------------------------------------------
+        # 兼容旧 train.py 里传入的其他参数
+        # -------------------------------------------------
+        **kwargs
     ):
         super().__init__()
 
         self.num_classes = num_classes
-        self.dims = dims
-        self.depths = depths
+        self.dims = tuple(dims)
+        self.depths = tuple(depths)
+
+        self.num_cnn_blocks = num_cnn_blocks
+        self.num_vss_blocks = num_vss_blocks
+        self.vss_use_checkpoint = vss_use_checkpoint
+        self.drop_path_rate = drop_path_rate
+
+        self.cnn_pretrained = cnn_pretrained
+        self.cnn_pretrained_path = cnn_pretrained_path
+
+        self.use_bgsm = use_bgsm
 
         # -------------------------------------------------
-        # mstc topology setting
-        # -------------------------------------------------
-        # topology_pairs 决定 mstc 输出通道数。
-        #
-        # Potsdam / Vaihingen:
-        #   K = 4
-        #
-        # LoveDA:
-        #   K = 5
-        #
-        # GID:
-        #   根据 topology_configs.py 决定
+        # Topology setting
+        # topology_pairs 决定 conn_logits 输出通道数 K。
         # -------------------------------------------------
         if topology_pairs is None:
             topology_pairs = [
@@ -91,120 +149,19 @@ class TopoMamba(nn.Module):
         self.num_conn_channels = len(topology_pairs)
 
         # -------------------------------------------------
-        # Boundary prior extractor
-        # -------------------------------------------------
-        # 输入原图 x: [B, 3, H, W]
-        # 输出边界先验 boundary_prior: [B, 1, H, W]
-        #
-        # 这个模块提取图像级边界先验，之后送入每一层 BGSM。
-        # -------------------------------------------------
-        self.boundary_extractor = BoundaryPriorExtractor(
-            in_channels=3,
-            hidden_channels=16
-        )
-
-        # -------------------------------------------------
         # High-resolution shallow branch
-        # 原图 -> 高分辨率浅层特征
-        # f0: [B, 32, H, W]
+        #
+        # f0:
+        #   [B, 32, H, W]
+        #
+        # f0_down:
+        #   [B, 32, H/2, W/2]
         # -------------------------------------------------
         self.resnet0 = ResNet0(
             in_ch=3,
             out_ch=32
         )
 
-        # -------------------------------------------------
-        # Stem: image -> 1/4 resolution
-        # f1: [B, 64, H/4, W/4]
-        # -------------------------------------------------
-        resnet34_pretrained = tv_models.resnet34(
-            weights=tv_models.ResNet34_Weights.IMAGENET1K_V1
-        )
-
-        self.stem = nn.Sequential(
-            resnet34_pretrained.conv1,  # [B, 64, H/2, W/2]
-            resnet34_pretrained.bn1,
-            resnet34_pretrained.relu,
-            resnet34_pretrained.maxpool,  # [B, 64, H/4, W/4]
-            resnet34_pretrained.layer1,  # [B, 64, H/4, W/4]
-        )
-
-        # -------------------------------------------------
-        # TPDB Encoder stages
-        # dims = [64, 128, 256, 512]
-        # -------------------------------------------------
-        self.stages, self.mergings = build_encoder_stages(
-            dims,
-            depths
-        )
-
-        # -------------------------------------------------
-        # Boundary-Guided State Modulation modules
-        # -------------------------------------------------
-        # BGSM 放在每个 TPDB stage 输入之前。
-        #
-        # 原来:
-        #   f1 -> Stage1
-        #   f2 -> Stage2
-        #   f3 -> Stage3
-        #   f4 -> Stage4
-        #
-        # 现在:
-        #   f1 -> BGSM1 -> Stage1
-        #   f2 -> BGSM2 -> Stage2
-        #   f3 -> BGSM3 -> Stage3
-        #   f4 -> BGSM4 -> Stage4
-        #
-        # 这样边界先验会进入 encoder 主干，
-        # 从而影响 TPDB/Mamba/SSM 的输入状态建模。
-        # -------------------------------------------------
-        self.bgsm1 = BoundaryStateModulator(
-            channels=dims[0]
-        )  # 64 channels, H/4
-
-        self.bgsm2 = BoundaryStateModulator(
-            channels=dims[1]
-        )  # 128 channels, H/8
-
-        self.bgsm3 = BoundaryStateModulator(
-            channels=dims[2]
-        )  # 256 channels, H/16
-
-        self.bgsm4 = BoundaryStateModulator(
-            channels=dims[3]
-        )  # 512 channels, H/32
-
-        # -------------------------------------------------
-        # SSA-M skip alignment modules
-        # -------------------------------------------------
-        self.ssam3 = SSA_M(
-            dims[2],
-            dims[3],
-            dims[2]
-        )   # 256 <- 512
-
-        self.ssam2 = SSA_M(
-            dims[1],
-            dims[2],
-            dims[1]
-        )   # 128 <- 256
-
-        self.ssam1 = SSA_M(
-            dims[0],
-            dims[1],
-            dims[0]
-        )   # 64 <- 128
-
-        self.ssam0 = SSA_M(
-            32,
-            dims[0],
-            32
-        )   # 32 <- 64
-
-        # -------------------------------------------------
-        # F0 downsampler: H -> H/2
-        # f0_down: [B, 32, H/2, W/2]
-        # -------------------------------------------------
         self.f0_down = nn.Sequential(
             nn.Conv2d(
                 32,
@@ -219,73 +176,230 @@ class TopoMamba(nn.Module):
         )
 
         # -------------------------------------------------
-        # Multi-scale mstc heads
+        # Stem
         #
-        # mstc 接在 SSA-M 输出之后，decoder 之前。
+        # 输入:
+        #   x: [B, 3, H, W]
         #
-        # g0: [B, 32,  H/2,  W/2]
-        # g1: [B, 64,  H/4,  W/4]
-        # g2: [B, 128, H/8,  W/8]
-        # g3: [B, 256, H/16, W/16]
+        # 输出:
+        #   f1: [B, 64, H/4, W/4]
         #
-        # conn_logits 顺序:
-        #   [conn_g0, conn_g1, conn_g2, conn_g3]
+        # 注意：
+        #   这里仍然保留你原来的 stem 逻辑。
+        #   TPDB 的 CNN branch 预训练在 build_encoder_stages 里完成。
+        # -------------------------------------------------
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                3,
+                self.dims[0] // 2,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(self.dims[0] // 2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                self.dims[0] // 2,
+                self.dims[0] // 2,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(self.dims[0] // 2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                self.dims[0] // 2,
+                self.dims[0],
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(self.dims[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        # -------------------------------------------------
+        # TPDB Encoder
         #
-        # 这个顺序是高分辨率 -> 低分辨率，
-        # 对应 loss 里的 conn_scale_weights = [0.4, 0.3, 0.2, 0.1]
+        # stages[i] 内部是：
+        #   TPDBlock = CNN branch + VSS branch + DGF
+        #
+        # mergings[i] 负责 stage 间下采样。
+        #
+        # 输出：
+        #   s1: [B,  64, H/4,  W/4]
+        #   s2: [B, 128, H/8,  W/8]
+        #   s3: [B, 256, H/16, W/16]
+        #   s4: [B, 512, H/32, W/32]
+        # -------------------------------------------------
+        self.stages, self.mergings = build_encoder_stages(
+            dims=list(self.dims),
+            depths=list(self.depths),
+            num_cnn_blocks=num_cnn_blocks,
+            num_vss_blocks=num_vss_blocks,
+            vss_use_checkpoint=vss_use_checkpoint,
+            drop_path_rate=drop_path_rate,
+
+            cnn_pretrained=cnn_pretrained,
+            cnn_pretrained_path=cnn_pretrained_path,
+        )
+
+        # -------------------------------------------------
+        # Boundary prior extractor + BGSM
+        # -------------------------------------------------
+        if self.use_bgsm:
+            self.boundary_extractor = BoundaryPriorExtractor(
+                in_channels=3,
+                hidden_channels=16
+            )
+
+            self.bgsm1 = BoundaryStateModulator(
+                channels=self.dims[0]
+            )
+            self.bgsm2 = BoundaryStateModulator(
+                channels=self.dims[1]
+            )
+            self.bgsm3 = BoundaryStateModulator(
+                channels=self.dims[2]
+            )
+            self.bgsm4 = BoundaryStateModulator(
+                channels=self.dims[3]
+            )
+
+        # -------------------------------------------------
+        # SSA-M skip alignment modules
+        #
+        # g3 = ssam3(s3, s4)
+        # g2 = ssam2(s2, s3)
+        # g1 = ssam1(s1, s2)
+        # g0 = ssam0(f0_down, s1)
+        # -------------------------------------------------
+        self.ssam3 = SSA_M(
+            self.dims[2],
+            self.dims[3],
+            self.dims[2]
+        )
+
+        self.ssam2 = SSA_M(
+            self.dims[1],
+            self.dims[2],
+            self.dims[1]
+        )
+
+        self.ssam1 = SSA_M(
+            self.dims[0],
+            self.dims[1],
+            self.dims[0]
+        )
+
+        self.ssam0 = SSA_M(
+            32,
+            self.dims[0],
+            32
+        )
+
+        # -------------------------------------------------
+        # Multi-scale connectivity / topology heads
+        #
+        # conn_logits[0]: g0, [B, K, H/2,  W/2]
+        # conn_logits[1]: g1, [B, K, H/4,  W/4]
+        # conn_logits[2]: g2, [B, K, H/8,  W/8]
+        # conn_logits[3]: g3, [B, K, H/16, W/16]
         # -------------------------------------------------
         self.mstc_heads = nn.ModuleList([
-            MSTC(
+            build_conn_head(
                 in_channels=32,
                 out_channels=self.num_conn_channels
             ),
-            MSTC(
-                in_channels=dims[0],
+            build_conn_head(
+                in_channels=self.dims[0],
                 out_channels=self.num_conn_channels
             ),
-            MSTC(
-                in_channels=dims[1],
+            build_conn_head(
+                in_channels=self.dims[1],
                 out_channels=self.num_conn_channels
             ),
-            MSTC(
-                in_channels=dims[2],
+            build_conn_head(
+                in_channels=self.dims[2],
                 out_channels=self.num_conn_channels
             ),
         ])
 
+        # 兼容旧名字。
+        # forward 里统一用 self.mstc_heads。
+        self.conn_heads = self.mstc_heads
+        self.dcpm_heads = self.mstc_heads
+
         # -------------------------------------------------
         # Decoder
-        # G0/G1/G2/G3 channels = [32, 64, 128, 256]
-        # deepest feature = s4, channel = 512
+        #
+        # 输入：
+        #   f4_enh: [B, 512, H/32, W/32]
+        #   g3:     [B, 256, H/16, W/16]
+        #   g2:     [B, 128, H/8,  W/8]
+        #   g1:     [B, 64,  H/4,  W/4]
+        #   g0:     [B, 32,  H/2,  W/2]
         # -------------------------------------------------
         self.decoder = Decoder(
             encoder_channels=[32, 64, 128, 256],
             num_classes=num_classes
         )
 
+        self._print_model_summary_once = True
+
+    def _maybe_print_summary(self):
+        """
+        只打印一次模型关键信息。
+        DDP 下每个 rank 可能都会打印一次，不影响训练。
+        """
+        if not self._print_model_summary_once:
+            return
+
+        print("=" * 80)
+        print("[TopoMamba] Build model: TPDB dual-branch encoder version")
+        print(f"  num_classes:          {self.num_classes}")
+        print(f"  dims:                 {self.dims}")
+        print(f"  depths:               {self.depths}")
+        print(f"  topology channels:    {self.num_conn_channels}")
+        print(f"  conn head:            {_CONN_HEAD_NAME}")
+        print(f"  use_bgsm:             {self.use_bgsm}")
+        print(f"  num_cnn_blocks:       {self.num_cnn_blocks}")
+        print(f"  num_vss_blocks:       {self.num_vss_blocks}")
+        print(f"  cnn_pretrained:       {self.cnn_pretrained}")
+        print(f"  cnn_pretrained_path:  {self.cnn_pretrained_path}")
+        print("=" * 80)
+
+        self._print_model_summary_once = False
+
     def forward(self, x):
         """
         Args:
-            x: [B, 3, H, W]
+            x:
+                [B, 3, H, W]
 
         Returns:
             outputs: dict
-                seg_logits:
-                    [B, num_classes, H, W]
 
-                edge_preds:
-                    list of 4 tensors,
-                    each tensor is [B, 1, H, W]
+            outputs["seg_logits"]:
+                [B, num_classes, H, W]
 
-                conn_logits:
-                    list of 4 tensors:
-                        conn_logits[0]: [B, K, H/2,  W/2]
-                        conn_logits[1]: [B, K, H/4,  W/4]
-                        conn_logits[2]: [B, K, H/8,  W/8]
-                        conn_logits[3]: [B, K, H/16, W/16]
+            outputs["edge_preds"]:
+                list of edge predictions, produced by decoder
 
-                    K = len(topology_pairs)
+            outputs["conn_logits"]:
+                list of 4 tensors:
+                    conn_logits[0]: [B, K, H/2,  W/2]
+                    conn_logits[1]: [B, K, H/4,  W/4]
+                    conn_logits[2]: [B, K, H/8,  W/8]
+                    conn_logits[3]: [B, K, H/16, W/16]
         """
+
+        self._maybe_print_summary()
 
         # -------------------------------------------------
         # 0. Save original image size
@@ -293,82 +407,59 @@ class TopoMamba(nn.Module):
         out_size = x.shape[2:]
 
         # -------------------------------------------------
-        # 1. Boundary prior
-        # -------------------------------------------------
-        # boundary_prior: [B, 1, H, W]
-        #
-        # 这个边界先验后续会被每个 BGSM 自动 resize 到对应尺度。
-        # -------------------------------------------------
-        boundary_prior = self.boundary_extractor(x)
-
-        # -------------------------------------------------
-        # 2. High-resolution shallow feature
+        # 1. High-resolution shallow feature
         # -------------------------------------------------
         f0 = self.resnet0(x)          # [B, 32, H, W]
         f0_down = self.f0_down(f0)    # [B, 32, H/2, W/2]
 
         # -------------------------------------------------
+        # 2. Boundary prior
+        # -------------------------------------------------
+        if self.use_bgsm:
+            boundary_prior = self.boundary_extractor(x)
+        else:
+            boundary_prior = None
+
+        # -------------------------------------------------
         # 3. Stem
-        # -------------------------------------------------
-        f1 = self.stem(x)             # [B, 64, H/4, W/4]
-
-        # -------------------------------------------------
-        # 4. Encoder stages with BGSM
-        # -------------------------------------------------
-
-        # -------------------------------------------------
-        # Stage 1
-        # -------------------------------------------------
-        # 原来:
-        #   s1 = self.stages[0](f1)
         #
-        # 现在:
-        #   f1 -> BGSM1 -> Stage1
+        # f1: [B, 64, H/4, W/4]
+        # -------------------------------------------------
+        f1 = self.stem(x)
+
+        # -------------------------------------------------
+        # 4. TPDB Encoder
         #
-        # BGSM1 会把 boundary_prior resize 到 H/4, W/4。
+        # 每个 stage 内部：
+        #   CNN branch + VSS branch + DGF
         # -------------------------------------------------
-        f1 = self.bgsm1(
-            f1,
-            boundary_prior
-        )
-        s1 = self.stages[0](f1)       # [B, 64, H/4, W/4]
-        f2 = self.mergings[0](s1)     # [B, 128, H/8, W/8]
+        if self.use_bgsm:
+            f1 = self.bgsm1(f1, boundary_prior)
 
-        # -------------------------------------------------
-        # Stage 2
-        # -------------------------------------------------
-        f2 = self.bgsm2(
-            f2,
-            boundary_prior
-        )
-        s2 = self.stages[1](f2)       # [B, 128, H/8, W/8]
-        f3 = self.mergings[1](s2)     # [B, 256, H/16, W/16]
+        s1 = self.stages[0](f1)          # [B, 64, H/4, W/4]
+        f2 = self.mergings[0](s1)        # [B, 128, H/8, W/8]
 
-        # -------------------------------------------------
-        # Stage 3
-        # -------------------------------------------------
-        f3 = self.bgsm3(
-            f3,
-            boundary_prior
-        )
-        s3 = self.stages[2](f3)       # [B, 256, H/16, W/16]
-        f4 = self.mergings[2](s3)     # [B, 512, H/32, W/32]
+        if self.use_bgsm:
+            f2 = self.bgsm2(f2, boundary_prior)
 
-        # -------------------------------------------------
-        # Stage 4
-        # -------------------------------------------------
-        f4 = self.bgsm4(
-            f4,
-            boundary_prior
-        )
-        s4 = self.stages[3](f4)       # [B, 512, H/32, W/32]
+        s2 = self.stages[1](f2)          # [B, 128, H/8, W/8]
+        f3 = self.mergings[1](s2)        # [B, 256, H/16, W/16]
+
+        if self.use_bgsm:
+            f3 = self.bgsm3(f3, boundary_prior)
+
+        s3 = self.stages[2](f3)          # [B, 256, H/16, W/16]
+        f4 = self.mergings[2](s3)        # [B, 512, H/32, W/32]
+
+        if self.use_bgsm:
+            f4 = self.bgsm4(f4, boundary_prior)
+
+        s4 = self.stages[3](f4)          # [B, 512, H/32, W/32]
 
         # -------------------------------------------------
         # 5. Deep feature
-        #
-        # 当前版本完全不使用 MSSE，直接使用 Stage 4 输出。
         # -------------------------------------------------
-        f4_enh = s4                   # [B, 512, H/32, W/32]
+        f4_enh = s4
 
         # -------------------------------------------------
         # 6. SSA-M skip connections
@@ -394,16 +485,13 @@ class TopoMamba(nn.Module):
         )   # [B, 32, H/2, W/2]
 
         # -------------------------------------------------
-        # 7. Multi-scale mstc
-        #
-        # mstc 继续保留，用作多尺度连通性 side supervision。
-        # 它不直接改变 decoder 主特征流，但会通过 conn_loss 反向约束 g0/g1/g2/g3。
+        # 7. Multi-scale connectivity / topology logits
         # -------------------------------------------------
         conn_logits = [
-            self.mstc_heads[0](g0),
-            self.mstc_heads[1](g1),
-            self.mstc_heads[2](g2),
-            self.mstc_heads[3](g3),
+            self.mstc_heads[0](g0),   # [B, K, H/2,  W/2]
+            self.mstc_heads[1](g1),   # [B, K, H/4,  W/4]
+            self.mstc_heads[2](g2),   # [B, K, H/8,  W/8]
+            self.mstc_heads[3](g3),   # [B, K, H/16, W/16]
         ]
 
         # -------------------------------------------------
@@ -419,8 +507,50 @@ class TopoMamba(nn.Module):
         )
 
         # -------------------------------------------------
-        # 9. Add multi-scale mstc outputs
+        # 9. Add conn_logits
         # -------------------------------------------------
         outputs["conn_logits"] = conn_logits
 
         return outputs
+
+
+if __name__ == "__main__":
+    """
+    简单 forward 测试：
+        python models/build_model.py
+    """
+    from utils.topology_configs import get_topology_pairs
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = TopoMamba(
+        num_classes=6,
+        topology_pairs=get_topology_pairs("potsdam"),
+        dims=(64, 128, 256, 512),
+        depths=(1, 1, 1, 1),
+        num_cnn_blocks=2,
+        num_vss_blocks=1,
+        cnn_pretrained=True,
+        cnn_pretrained_path=None,
+        use_bgsm=True,
+    ).to(device).eval()
+
+    x = torch.randn(2, 3, 512, 512).to(device)
+
+    with torch.no_grad():
+        outputs = model(x)
+
+    print("outputs keys:", outputs.keys())
+    print("seg_logits:", outputs["seg_logits"].shape)
+
+    if "edge_preds" in outputs:
+        print("edge_preds:", len(outputs["edge_preds"]))
+        for i, v in enumerate(outputs["edge_preds"]):
+            print(f"  edge {i}: {v.shape}")
+
+    if "conn_logits" in outputs:
+        print("conn_logits:", len(outputs["conn_logits"]))
+        for i, v in enumerate(outputs["conn_logits"]):
+            print(f"  conn {i}: {v.shape}")
+
+    print("TopoMamba TPDB + ResNet18-pretrained CNN branch forward OK")
