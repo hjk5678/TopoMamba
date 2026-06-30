@@ -97,7 +97,7 @@ class RandomScaleCrop(object):
 
     def __init__(
         self,
-        crop_size=512,
+        crop_size=1024,
         scale_range=(0.75, 1.5),
         ignore_index=255
     ):
@@ -329,7 +329,7 @@ class ISPRSDataset(Dataset):
         img_dir,
         label_dir,
         split="train",
-        crop_size=512,
+        crop_size=1024,
         transform=None,
         pre_cropped=False,
         processed_dir=None
@@ -343,9 +343,14 @@ class ISPRSDataset(Dataset):
 
         if pre_cropped:
             if processed_dir is None:
+                processed_name = (
+                    "processed"
+                    if self.crop_size == 512
+                    else f"processed_{self.crop_size}"
+                )
                 processed_dir = os.path.join(
                     os.path.dirname(img_dir),
-                    "processed",
+                    processed_name,
                     split
                 )
 
@@ -645,7 +650,7 @@ def get_transform(
     split="train",
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
-    crop_size=512,
+    crop_size=1024,
     scale_range=(0.75, 1.5),
     strong_aug=True
 ):
@@ -713,7 +718,7 @@ def build_dataset(
     split="train",
     pre_cropped=False,
     processed_dir=None,
-    crop_size=512,
+    crop_size=1024,
     strong_aug=True
 ):
     transform = get_transform(
@@ -743,9 +748,14 @@ def build_dataset(
 
         if pre_cropped:
             if processed_dir is None:
+                processed_name = (
+                    "processed"
+                    if crop_size == 512
+                    else f"processed_{crop_size}"
+                )
                 processed_dir = os.path.join(
                     root_dir,
-                    "processed",
+                    processed_name,
                     split
                 )
 

@@ -14,7 +14,12 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from data.dataset import ISPRS_PALETTE, Normalize, ToTensor
-from models.build_model import TopoMamba
+from models.build_model import (
+    CLUSTER_GRAPH_LAYOUT,
+    DECODER_LAYOUT,
+    RMP_SCAN_LAYOUT,
+    TopoMamba,
+)
 from utils.topology_configs import get_topology_pairs
 
 
@@ -118,8 +123,8 @@ def get_image_path(args):
 def sliding_window_inference(
     model,
     img,
-    crop_size=512,
-    stride=256,
+    crop_size=1024,
+    stride=512,
     num_classes=6,
     device="cuda",
 ):
@@ -231,8 +236,8 @@ def main():
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="output")
-    parser.add_argument("--crop_size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--crop_size", type=int, default=1024)
+    parser.add_argument("--stride", type=int, default=512)
 
     args = parser.parse_args()
 
@@ -266,6 +271,42 @@ def main():
     state_dict, checkpoint_topology_pairs, checkpoint_args = load_checkpoint(
         checkpoint_path
     )
+
+    if checkpoint_args.get("use_gia", False) or any(
+        key.replace("module.", "").startswith("graph_interaction.")
+        for key in state_dict
+    ):
+        raise RuntimeError(
+            "This checkpoint contains the removed GIA attention path and is "
+            "not compatible with the attention-free MS-CGC model."
+        )
+
+    if checkpoint_args.get("use_rmp_vss", False):
+        checkpoint_layout = checkpoint_args.get("rmp_scan_layout")
+        if checkpoint_layout != RMP_SCAN_LAYOUT:
+            raise RuntimeError(
+                "Checkpoint multi-path layout is incompatible with the current "
+                f"model: checkpoint={checkpoint_layout!r}, "
+                f"current={RMP_SCAN_LAYOUT!r}."
+            )
+
+    checkpoint_decoder_layout = checkpoint_args.get("decoder_layout")
+    if checkpoint_decoder_layout != DECODER_LAYOUT:
+        raise RuntimeError(
+            "Checkpoint decoder layout is incompatible with the current "
+            f"model: checkpoint={checkpoint_decoder_layout!r}, "
+            f"current={DECODER_LAYOUT!r}."
+        )
+
+    if checkpoint_args.get("use_cluster_gcn", False):
+        checkpoint_cluster_layout = checkpoint_args.get("cluster_graph_layout")
+        if checkpoint_cluster_layout != CLUSTER_GRAPH_LAYOUT:
+            raise RuntimeError(
+                "Checkpoint cluster graph layout is incompatible with the "
+                f"current model: checkpoint={checkpoint_cluster_layout!r}, "
+                f"current={CLUSTER_GRAPH_LAYOUT!r}."
+            )
+
     topology_pairs = checkpoint_topology_pairs or get_topology_pairs(args.dataset)
 
     model = TopoMamba(
@@ -274,10 +315,19 @@ def main():
         cnn_pretrained=False,
         use_rmp_vss=checkpoint_args.get("use_rmp_vss", False),
         rmp_num_paths=checkpoint_args.get("rmp_num_paths", 4),
-        use_gia=checkpoint_args.get("use_gia", False),
-        gia_dim=checkpoint_args.get("gia_dim", 64),
-        gia_heads=checkpoint_args.get("gia_heads", 4),
-        skip_mode=checkpoint_args.get("skip_mode", "ssam"),
+        rmp_window_size=checkpoint_args.get("rmp_window_size", 8),
+        rmp_atrous_rate=checkpoint_args.get("rmp_atrous_rate", 2),
+        use_cluster_gcn=checkpoint_args.get("use_cluster_gcn", False),
+        cluster_counts=checkpoint_args.get(
+            "cluster_counts",
+            [256, 128, 64, 32],
+        ),
+        cluster_graph_dim=checkpoint_args.get("cluster_graph_dim", 64),
+        cluster_iters=checkpoint_args.get("cluster_iters", 2),
+        cluster_spatial_weight=checkpoint_args.get(
+            "cluster_spatial_weight",
+            0.5,
+        ),
     )
 
     load_info = model.load_state_dict(state_dict, strict=False)
@@ -300,9 +350,23 @@ def main():
     print(
         "Architecture flags: "
         f"use_rmp_vss={checkpoint_args.get('use_rmp_vss', False)}, "
-        f"use_gia={checkpoint_args.get('use_gia', False)}, "
-        f"skip_mode={checkpoint_args.get('skip_mode', 'ssam')}"
+        f"use_cluster_gcn={checkpoint_args.get('use_cluster_gcn', False)}"
     )
+    print(f"Decoder layout: {checkpoint_args.get('decoder_layout')}")
+    if checkpoint_args.get("use_cluster_gcn", False):
+        print(
+            "Cluster graph: "
+            f"{checkpoint_args.get('cluster_graph_layout')} | "
+            f"counts={checkpoint_args.get('cluster_counts')} | "
+            f"dim={checkpoint_args.get('cluster_graph_dim', 64)}"
+        )
+    if checkpoint_args.get("use_rmp_vss", False):
+        print(
+            "RMP scan layout: "
+            f"{checkpoint_args.get('rmp_scan_layout')} | "
+            f"window={checkpoint_args.get('rmp_window_size', 8)} | "
+            f"atrous_rate={checkpoint_args.get('rmp_atrous_rate', 2)}"
+        )
 
     pred = sliding_window_inference(
         model,

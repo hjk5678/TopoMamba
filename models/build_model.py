@@ -1,16 +1,15 @@
 import torch
 import torch.nn as nn
 
-from models.encoder.resnet0 import ResNet0
-from models.encoder.ssa_m import SSA_M
 from models.encoder.rmtpb import build_encoder_stages
-from models.decoder.decoder import Decoder, EncoderAlignedDecoder
+from models.decoder.decoder import EncoderAlignedDecoder
 
-from models.boundary_guidance import (
-    BoundaryPriorExtractor,
-    BoundaryStateModulator,
-)
-from models.graph_interaction import GraphInteractionAttention
+from models.cluster_graph import MultiScaleClusterGraph
+
+
+RMP_SCAN_LAYOUT = "global_local_diagonal_atrous_v1"
+DECODER_LAYOUT = "bau_classic_unet4_local_boundary_v1"
+CLUSTER_GRAPH_LAYOUT = "multiscale_hard_cluster_gcn_v1"
 
 
 # ============================================================
@@ -51,20 +50,9 @@ class TopoMamba(nn.Module):
 
     当前版本结构：
 
-        Input image
-            ├── ResNet0 high-resolution branch
-            │       f0:      [B, 32, H,   W]
-            │       f0_down: [B, 32, H/2, W/2]
-            │
-            └── RMTPB encoder
-                    stem: [B, 64, H/4, W/4]
-                    stage1: RMTPB(CNN branch + multi-path VSS branch + DGF)
-                    merge1
-                    stage2: RMTPB(CNN branch + multi-path VSS branch + DGF)
-                    merge2
-                    stage3: RMTPB(CNN branch + multi-path VSS branch + DGF)
-                    merge3
-                    stage4: RMTPB(CNN branch + multi-path VSS branch + DGF)
+        Input image -> stem -> S1 -> S2 -> S3 -> S4 -> bottleneck
+                              |     |     |     |
+                              +-----+-----+-----+-> four BAU skip connections
 
     RMTPB 内部：
         CNN branch:
@@ -106,6 +94,8 @@ class TopoMamba(nn.Module):
         drop_path_rate=0.1,
         use_rmp_vss=False,
         rmp_num_paths=4,
+        rmp_window_size=8,
+        rmp_atrous_rate=2,
 
         # -------------------------------------------------
         # CNN branch pretrained settings
@@ -113,14 +103,11 @@ class TopoMamba(nn.Module):
         cnn_pretrained=True,
         cnn_pretrained_path=None,
 
-        # -------------------------------------------------
-        # Boundary guidance
-        # -------------------------------------------------
-        use_bgsm=True,
-        use_gia=False,
-        gia_dim=64,
-        gia_heads=4,
-        skip_mode="encoder",
+        use_cluster_gcn=False,
+        cluster_counts=(256, 128, 64, 32),
+        cluster_graph_dim=64,
+        cluster_iters=2,
+        cluster_spatial_weight=0.5,
 
         # -------------------------------------------------
         # 兼容旧 train.py 里传入的其他参数
@@ -139,36 +126,21 @@ class TopoMamba(nn.Module):
         self.drop_path_rate = drop_path_rate
         self.use_rmp_vss = use_rmp_vss
         self.rmp_num_paths = rmp_num_paths
+        self.rmp_window_size = rmp_window_size
+        self.rmp_atrous_rate = rmp_atrous_rate
+        self.rmp_scan_layout = RMP_SCAN_LAYOUT
 
         self.cnn_pretrained = cnn_pretrained
         self.cnn_pretrained_path = cnn_pretrained_path
 
-        self.use_bgsm = use_bgsm
-        self.use_gia = use_gia
-        self.gia_dim = gia_dim
-        self.gia_heads = gia_heads
-        self.skip_mode = str(skip_mode).lower()
-
-        if self.skip_mode not in ["ssam", "basic", "encoder"]:
-            raise ValueError(
-                f"Unsupported skip_mode={skip_mode}. "
-                "Expected 'ssam', 'basic', or 'encoder'."
-            )
-
-        if self.skip_mode == "encoder":
-            self.skip_channels = [
-                self.dims[0],
-                self.dims[1],
-                self.dims[2],
-                self.dims[3],
-            ]
-        else:
-            self.skip_channels = [
-                32,
-                self.dims[0],
-                self.dims[1],
-                self.dims[2],
-            ]
+        self.use_cluster_gcn = bool(use_cluster_gcn)
+        self.cluster_counts = tuple(int(value) for value in cluster_counts)
+        self.cluster_graph_dim = int(cluster_graph_dim)
+        self.cluster_iters = int(cluster_iters)
+        self.cluster_spatial_weight = float(cluster_spatial_weight)
+        self.cluster_graph_layout = CLUSTER_GRAPH_LAYOUT
+        self.decoder_layout = DECODER_LAYOUT
+        self.skip_channels = list(self.dims)
 
         # -------------------------------------------------
         # Topology setting
@@ -181,58 +153,6 @@ class TopoMamba(nn.Module):
 
         self.topology_pairs = topology_pairs
         self.num_conn_channels = len(topology_pairs)
-
-        # -------------------------------------------------
-        # High-resolution shallow branch
-        #
-        # f0:
-        #   [B, 32, H, W]
-        #
-        # f0_down:
-        #   [B, 32, H/2, W/2]
-        # -------------------------------------------------
-        if self.skip_mode == "ssam":
-            self.resnet0 = ResNet0(
-                in_ch=3,
-                out_ch=32
-            )
-
-            self.f0_down = nn.Sequential(
-                nn.Conv2d(
-                    32,
-                    32,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    bias=False
-                ),
-                nn.BatchNorm2d(32),
-                nn.ReLU(inplace=True),
-            )
-        elif self.skip_mode == "basic":
-            self.basic_skip0 = nn.Sequential(
-                nn.Conv2d(
-                    3,
-                    32,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    bias=False
-                ),
-                nn.BatchNorm2d(32),
-                nn.ReLU(inplace=True),
-
-                nn.Conv2d(
-                    32,
-                    32,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    bias=False
-                ),
-                nn.BatchNorm2d(32),
-                nn.ReLU(inplace=True),
-            )
 
         # -------------------------------------------------
         # Stem
@@ -305,83 +225,29 @@ class TopoMamba(nn.Module):
             drop_path_rate=drop_path_rate,
             use_rmp_vss=use_rmp_vss,
             rmp_num_paths=rmp_num_paths,
+            rmp_window_size=rmp_window_size,
+            rmp_atrous_rate=rmp_atrous_rate,
 
             cnn_pretrained=cnn_pretrained,
             cnn_pretrained_path=cnn_pretrained_path,
         )
 
-        # -------------------------------------------------
-        # Boundary prior extractor + BGSM
-        # -------------------------------------------------
-        if self.use_bgsm:
-            self.boundary_extractor = BoundaryPriorExtractor(
-                in_channels=3,
-                hidden_channels=16
-            )
-
-            self.bgsm1 = BoundaryStateModulator(
-                channels=self.dims[0]
-            )
-            self.bgsm2 = BoundaryStateModulator(
-                channels=self.dims[1]
-            )
-            self.bgsm3 = BoundaryStateModulator(
-                channels=self.dims[2]
-            )
-            self.bgsm4 = BoundaryStateModulator(
-                channels=self.dims[3]
-            )
-
-        # -------------------------------------------------
-        # SSA-M skip alignment modules
-        #
-        # g3 = ssam3(s3, s4)
-        # g2 = ssam2(s2, s3)
-        # g1 = ssam1(s1, s2)
-        # g0 = ssam0(f0_down, s1)
-        # -------------------------------------------------
-        if self.skip_mode == "ssam":
-            self.ssam3 = SSA_M(
-                self.dims[2],
-                self.dims[3],
-                self.dims[2]
-            )
-
-            self.ssam2 = SSA_M(
-                self.dims[1],
-                self.dims[2],
-                self.dims[1]
-            )
-
-            self.ssam1 = SSA_M(
-                self.dims[0],
-                self.dims[1],
-                self.dims[0]
-            )
-
-            self.ssam0 = SSA_M(
-                32,
-                self.dims[0],
-                32
-            )
-
-        # -------------------------------------------------
-        # Graph interaction attention over multi-scale skips
-        # -------------------------------------------------
-        if self.use_gia:
-            self.graph_interaction = GraphInteractionAttention(
-                channels=self.skip_channels,
-                graph_dim=gia_dim,
-                num_heads=gia_heads,
+        if self.use_cluster_gcn:
+            self.cluster_graph = MultiScaleClusterGraph(
+                channels=self.dims,
+                cluster_counts=self.cluster_counts,
+                graph_dim=self.cluster_graph_dim,
+                num_cluster_iters=self.cluster_iters,
+                spatial_weight=self.cluster_spatial_weight,
             )
 
         # -------------------------------------------------
         # Multi-scale connectivity / topology heads
         #
-        # conn_logits[0]: g0, [B, K, H/2,  W/2]
-        # conn_logits[1]: g1, [B, K, H/4,  W/4]
-        # conn_logits[2]: g2, [B, K, H/8,  W/8]
-        # conn_logits[3]: g3, [B, K, H/16, W/16]
+        # conn_logits[0]: g1, [B, K, H/4,  W/4]
+        # conn_logits[1]: g2, [B, K, H/8,  W/8]
+        # conn_logits[2]: g3, [B, K, H/16, W/16]
+        # conn_logits[3]: g4, [B, K, H/32, W/32]
         # -------------------------------------------------
         self.mstc_heads = nn.ModuleList([
             build_conn_head(
@@ -397,25 +263,13 @@ class TopoMamba(nn.Module):
         self.dcpm_heads = self.mstc_heads
 
         # -------------------------------------------------
-        # Decoder
-        #
-        # 输入：
-        #   f4_enh: [B, 512, H/32, W/32]
-        #   g3:     [B, 256, H/16, W/16]
-        #   g2:     [B, 128, H/8,  W/8]
-        #   g1:     [B, 64,  H/4,  W/4]
-        #   g0:     [B, 32,  H/2,  W/2]
+        # Classical four-level U-Net decoder:
+        # bottleneck(H/64) + g4 + g3 + g2 + g1.
         # -------------------------------------------------
-        if self.skip_mode == "encoder":
-            self.decoder = EncoderAlignedDecoder(
-                encoder_channels=list(self.dims),
-                num_classes=num_classes
-            )
-        else:
-            self.decoder = Decoder(
-                encoder_channels=[32, 64, 128, 256],
-                num_classes=num_classes
-            )
+        self.decoder = EncoderAlignedDecoder(
+            encoder_channels=list(self.dims),
+            num_classes=num_classes,
+        )
 
         self._print_model_summary_once = True
 
@@ -434,14 +288,22 @@ class TopoMamba(nn.Module):
         print(f"  depths:               {self.depths}")
         print(f"  topology channels:    {self.num_conn_channels}")
         print(f"  conn head:            {_CONN_HEAD_NAME}")
-        print(f"  use_bgsm:             {self.use_bgsm}")
         print(f"  num_cnn_blocks:       {self.num_cnn_blocks}")
         print(f"  num_vss_blocks:       {self.num_vss_blocks}")
         print(f"  use_rmp_vss:          {self.use_rmp_vss}")
         print(f"  rmp_num_paths:        {self.rmp_num_paths}")
-        print(f"  use_gia:              {self.use_gia}")
-        print(f"  gia_dim:              {self.gia_dim}")
-        print(f"  skip_mode:            {self.skip_mode}")
+        if self.use_rmp_vss:
+            print("  rmp_path_types:       global/local/diagonal/atrous")
+            print(f"  rmp_window_size:      {self.rmp_window_size}")
+            print(f"  rmp_atrous_rate:      {self.rmp_atrous_rate}")
+        print(f"  use_cluster_gcn:      {self.use_cluster_gcn}")
+        if self.use_cluster_gcn:
+            print(f"  cluster_layout:       {self.cluster_graph_layout}")
+            print(f"  cluster_counts:       {self.cluster_counts}")
+            print(f"  cluster_graph_dim:    {self.cluster_graph_dim}")
+            print(f"  cluster_iters:        {self.cluster_iters}")
+            print(f"  cluster_spatial_w:    {self.cluster_spatial_weight}")
+        print(f"  decoder_layout:       {self.decoder_layout}")
         print(f"  cnn_pretrained:       {self.cnn_pretrained}")
         print(f"  cnn_pretrained_path:  {self.cnn_pretrained_path}")
         print("=" * 80)
@@ -465,10 +327,10 @@ class TopoMamba(nn.Module):
 
             outputs["conn_logits"]:
                 list of 4 tensors:
-                    conn_logits[0]: [B, K, H/2,  W/2]
-                    conn_logits[1]: [B, K, H/4,  W/4]
-                    conn_logits[2]: [B, K, H/8,  W/8]
-                    conn_logits[3]: [B, K, H/16, W/16]
+                    conn_logits[0]: [B, K, H/4,  W/4]
+                    conn_logits[1]: [B, K, H/8,  W/8]
+                    conn_logits[2]: [B, K, H/16, W/16]
+                    conn_logits[3]: [B, K, H/32, W/32]
         """
 
         self._maybe_print_summary()
@@ -479,142 +341,57 @@ class TopoMamba(nn.Module):
         out_size = x.shape[2:]
 
         # -------------------------------------------------
-        # 1. Optional high-resolution shallow feature
-        # -------------------------------------------------
-        if self.skip_mode == "ssam":
-            f0 = self.resnet0(x)          # [B, 32, H, W]
-            f0_down = self.f0_down(f0)    # [B, 32, H/2, W/2]
-        else:
-            f0_down = None
-
-        # -------------------------------------------------
-        # 2. Boundary prior
-        # -------------------------------------------------
-        if self.use_bgsm:
-            boundary_prior = self.boundary_extractor(x)
-        else:
-            boundary_prior = None
-
-        # -------------------------------------------------
-        # 3. Stem
+        # 1. Stem
         #
         # f1: [B, 64, H/4, W/4]
         # -------------------------------------------------
         f1 = self.stem(x)
 
         # -------------------------------------------------
-        # 4. RMTPB Encoder
+        # 2. RMTPB Encoder
         #
         # 每个 stage 内部：
         #   CNN branch + VSS branch + DGF
         # -------------------------------------------------
-        if self.use_bgsm:
-            f1 = self.bgsm1(f1, boundary_prior)
-
         s1 = self.stages[0](f1)          # [B, 64, H/4, W/4]
         f2 = self.mergings[0](s1)        # [B, 128, H/8, W/8]
-
-        if self.use_bgsm:
-            f2 = self.bgsm2(f2, boundary_prior)
 
         s2 = self.stages[1](f2)          # [B, 128, H/8, W/8]
         f3 = self.mergings[1](s2)        # [B, 256, H/16, W/16]
 
-        if self.use_bgsm:
-            f3 = self.bgsm3(f3, boundary_prior)
-
         s3 = self.stages[2](f3)          # [B, 256, H/16, W/16]
         f4 = self.mergings[2](s3)        # [B, 512, H/32, W/32]
-
-        if self.use_bgsm:
-            f4 = self.bgsm4(f4, boundary_prior)
 
         s4 = self.stages[3](f4)          # [B, 512, H/32, W/32]
 
         # -------------------------------------------------
-        # 5. Deep feature
+        # 3. Four encoder skip connections
         # -------------------------------------------------
-        f4_enh = s4
+        g1, g2, g3, g4 = s1, s2, s3, s4
 
-        # -------------------------------------------------
-        # 6. Skip connections
-        # -------------------------------------------------
-        if self.skip_mode == "ssam":
-            g3 = self.ssam3(
-                s3,
-                f4_enh
-            )   # [B, 256, H/16, W/16]
-
-            g2 = self.ssam2(
-                s2,
-                s3
-            )   # [B, 128, H/8, W/8]
-
-            g1 = self.ssam1(
-                s1,
-                s2
-            )   # [B, 64, H/4, W/4]
-
-            g0 = self.ssam0(
-                f0_down,
-                s1
-            )   # [B, 32, H/2, W/2]
-        elif self.skip_mode == "basic":
-            g3 = s3
-            g2 = s2
-            g1 = s1
-            g0 = self.basic_skip0(x)
-
-        else:
-            g1 = s1
-            g2 = s2
-            g3 = s3
-            g4 = f4_enh
-
-        if self.use_gia:
-            if self.skip_mode == "encoder":
-                g1, g2, g3, g4 = self.graph_interaction([g1, g2, g3, g4])
-            else:
-                g0, g1, g2, g3 = self.graph_interaction([g0, g1, g2, g3])
+        if self.use_cluster_gcn:
+            g1, g2, g3, g4 = self.cluster_graph([g1, g2, g3, g4])
 
         # -------------------------------------------------
-        # 7. Multi-scale connectivity / topology logits
+        # 4. Multi-scale connectivity / topology logits
         # -------------------------------------------------
-        if self.skip_mode == "encoder":
-            conn_logits = [
-                self.mstc_heads[0](g1),   # [B, K, H/4,  W/4]
-                self.mstc_heads[1](g2),   # [B, K, H/8,  W/8]
-                self.mstc_heads[2](g3),   # [B, K, H/16, W/16]
-                self.mstc_heads[3](g4),   # [B, K, H/32, W/32]
-            ]
-        else:
-            conn_logits = [
-                self.mstc_heads[0](g0),   # [B, K, H/2,  W/2]
-                self.mstc_heads[1](g1),   # [B, K, H/4,  W/4]
-                self.mstc_heads[2](g2),   # [B, K, H/8,  W/8]
-                self.mstc_heads[3](g3),   # [B, K, H/16, W/16]
-            ]
+        conn_logits = [
+            self.mstc_heads[0](g1),   # [B, K, H/4,  W/4]
+            self.mstc_heads[1](g2),   # [B, K, H/8,  W/8]
+            self.mstc_heads[2](g3),   # [B, K, H/16, W/16]
+            self.mstc_heads[3](g4),   # [B, K, H/32, W/32]
+        ]
 
         # -------------------------------------------------
-        # 8. Decoder
+        # 5. Classical four-level U-Net decoder
         # -------------------------------------------------
-        if self.skip_mode == "encoder":
-            outputs = self.decoder(
-                g4,
-                g3,
-                g2,
-                g1,
-                out_size=out_size
-            )
-        else:
-            outputs = self.decoder(
-                f4_enh,
-                g3,
-                g2,
-                g1,
-                g0,
-                out_size=out_size
-            )
+        outputs = self.decoder(
+            g4,
+            g3,
+            g2,
+            g1,
+            out_size=out_size,
+        )
 
         # -------------------------------------------------
         # 9. Add conn_logits
@@ -642,7 +419,6 @@ if __name__ == "__main__":
         num_vss_blocks=1,
         cnn_pretrained=True,
         cnn_pretrained_path=None,
-        use_bgsm=True,
     ).to(device).eval()
 
     x = torch.randn(2, 3, 512, 512).to(device)

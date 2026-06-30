@@ -91,8 +91,44 @@ Useful options:
 - `--resume`: resume from a checkpoint
 - `--resume_model_only`: load model weights only
 - `--use_rmp_vss`: enable residual multi-path VSS branch
-- `--use_gia`: enable graph interaction attention
-- `--skip_mode`: `ssam`, `basic`, or `encoder`
+- `--rmp_window_size`: local-window Cross VSS window size (default: `8`)
+- `--rmp_atrous_rate`: Atrous Cross VSS sampling rate (default: `2`)
+- `--use_cluster_gcn`: enable attention-free multi-scale cluster GCN (MS-CGC)
+- `--cluster_counts S1 S2 S3 S4`: region-node counts (default: `256 128 64 32`)
+- `--cluster_graph_dim`: graph-node feature width (default: `64`)
+- `--cluster_iters`: hard-clustering iterations (default: `2`)
+- `--cluster_spatial_weight`: coordinate weight used by hard clustering (default: `0.5`)
+
+The current residual multi-path VSS layout uses four complementary paths:
+global Cross, shifted local-window Cross, bidirectional diagonal Cross, and
+Atrous Cross. Checkpoints produced by the earlier
+cross/unidirectional/bidirectional/rotated-cross layout are not structurally
+compatible with this version and should not be used to resume an RMP run.
+The current `bau_classic_unet4_local_boundary_v1` decoder uses four RMTPB skip features
+S1-S4, a separate H/64 bottleneck below S4, and four corresponding BAU stages:
+bottleneck+S4, then S3, S2, and S1. There is no parallel Detail Stem.
+Checkpoints from earlier decoder layouts are intentionally incompatible.
+
+There is no image-level boundary-prior branch. Each BAU derives its local
+boundary gate only from the corresponding encoder skip using Sobel and
+multi-scale LoG responses.
+The legacy ResNet0/SSA-M skip path has been removed; its checkpoints are no
+longer supported by this source tree.
+
+MS-CGC applies independent hard feature/coordinate clustering to encoder
+features S1-S4, builds graphs from spatially touching regions, runs two
+ordinary normalized-adjacency GCN layers, and broadcasts the region features
+back through a bounded residual. It contains no Q/K/V or multi-head attention.
+The former GIA multi-head-attention path has been removed. Checkpoints that
+contain GIA parameters are intentionally unsupported by this source tree.
+
+Before training the new layout, run its forward/backward smoke test:
+
+```bash
+python tools/test_rmp_scans.py
+python tools/test_decoder.py
+python tools/test_cluster_graph.py
+```
 
 ## Evaluation
 

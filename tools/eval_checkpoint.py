@@ -11,7 +11,12 @@ from tqdm import tqdm
 sys.path.append("/data/BUAS/HJK/TopoMamba")
 
 from data.dataset import ISPRSDataset, build_dataset, get_transform
-from models.build_model import TopoMamba
+from models.build_model import (
+    CLUSTER_GRAPH_LAYOUT,
+    DECODER_LAYOUT,
+    RMP_SCAN_LAYOUT,
+    TopoMamba,
+)
 from utils.losses import TopoMambaLoss
 from utils.topology_configs import get_topology_pairs
 
@@ -191,7 +196,12 @@ def build_val_dataset(args, num_classes):
 
         if args.pre_cropped:
             if args.processed_dir is None:
-                processed_dir = os.path.join(root, "processed", "val")
+                processed_name = (
+                    "processed"
+                    if args.crop_size == 512
+                    else f"processed_{args.crop_size}"
+                )
+                processed_dir = os.path.join(root, processed_name, "val")
             else:
                 processed_dir = os.path.join(args.processed_dir, "val")
 
@@ -239,7 +249,7 @@ def main():
     parser.add_argument("--processed_dir", type=str, default=None)
 
     parser.add_argument("--pre_cropped", action="store_true", default=False)
-    parser.add_argument("--crop_size", type=int, default=512)
+    parser.add_argument("--crop_size", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
 
@@ -306,6 +316,41 @@ def main():
 
     topology_pairs = topology_pairs or get_topology_pairs(args.dataset)
 
+    if checkpoint_args.get("use_gia", False) or any(
+        key.replace("module.", "").startswith("graph_interaction.")
+        for key in state_dict
+    ):
+        raise RuntimeError(
+            "This checkpoint contains the removed GIA attention path and is "
+            "not compatible with the attention-free MS-CGC model."
+        )
+
+    if checkpoint_args.get("use_rmp_vss", False):
+        checkpoint_layout = checkpoint_args.get("rmp_scan_layout")
+        if checkpoint_layout != RMP_SCAN_LAYOUT:
+            raise RuntimeError(
+                "Checkpoint multi-path layout is incompatible with the current "
+                f"model: checkpoint={checkpoint_layout!r}, "
+                f"current={RMP_SCAN_LAYOUT!r}."
+            )
+
+    checkpoint_decoder_layout = checkpoint_args.get("decoder_layout")
+    if checkpoint_decoder_layout != DECODER_LAYOUT:
+        raise RuntimeError(
+            "Checkpoint decoder layout is incompatible with the current "
+            f"model: checkpoint={checkpoint_decoder_layout!r}, "
+            f"current={DECODER_LAYOUT!r}."
+        )
+
+    if checkpoint_args.get("use_cluster_gcn", False):
+        checkpoint_cluster_layout = checkpoint_args.get("cluster_graph_layout")
+        if checkpoint_cluster_layout != CLUSTER_GRAPH_LAYOUT:
+            raise RuntimeError(
+                "Checkpoint cluster graph layout is incompatible with the "
+                f"current model: checkpoint={checkpoint_cluster_layout!r}, "
+                f"current={CLUSTER_GRAPH_LAYOUT!r}."
+            )
+
     model = TopoMamba(
         num_classes=num_classes,
         use_msse=True,
@@ -313,10 +358,19 @@ def main():
         cnn_pretrained=False,
         use_rmp_vss=checkpoint_args.get("use_rmp_vss", False),
         rmp_num_paths=checkpoint_args.get("rmp_num_paths", 4),
-        use_gia=checkpoint_args.get("use_gia", False),
-        gia_dim=checkpoint_args.get("gia_dim", 64),
-        gia_heads=checkpoint_args.get("gia_heads", 4),
-        skip_mode=checkpoint_args.get("skip_mode", "ssam"),
+        rmp_window_size=checkpoint_args.get("rmp_window_size", 8),
+        rmp_atrous_rate=checkpoint_args.get("rmp_atrous_rate", 2),
+        use_cluster_gcn=checkpoint_args.get("use_cluster_gcn", False),
+        cluster_counts=checkpoint_args.get(
+            "cluster_counts",
+            [256, 128, 64, 32],
+        ),
+        cluster_graph_dim=checkpoint_args.get("cluster_graph_dim", 64),
+        cluster_iters=checkpoint_args.get("cluster_iters", 2),
+        cluster_spatial_weight=checkpoint_args.get(
+            "cluster_spatial_weight",
+            0.5,
+        ),
     )
 
     state_dict = {

@@ -26,7 +26,12 @@ from data.dataset import (
     get_transform,
 )
 
-from models.build_model import TopoMamba
+from models.build_model import (
+    CLUSTER_GRAPH_LAYOUT,
+    DECODER_LAYOUT,
+    RMP_SCAN_LAYOUT,
+    TopoMamba,
+)
 from utils.losses import TopoMambaLoss
 from utils.topology_configs import (
     get_topology_pairs,
@@ -374,8 +379,8 @@ def build_param_group_optimizer(
             中等学习率：base_lr * vss_lr_mult
 
         3. 其他模块
-            stem / mergings / fusion / alpha / resnet0 / f0_down /
-            BGSM / SSA-M / MSTC / decoder
+            stem / mergings / fusion / alpha / bottleneck /
+            BGSM / MS-CGC / MSTC / decoder
             大学习率：base_lr * new_module_lr_mult
     """
 
@@ -437,16 +442,8 @@ def build_param_group_optimizer(
         "fusion",
         "alpha",
 
-        "resnet0",
-        "f0_down",
-        "basic_skip0",
 
-        "boundary_extractor",
-        "bgsm",
-
-        "ssam",
-        "graph_interaction",
-        "gia",
+        "cluster_graph",
         "mstc_heads",
         "conn_heads",
         "dcpm_heads",
@@ -1035,14 +1032,19 @@ def build_train_val_datasets(args, num_classes):
 
     if args.pre_cropped:
         if args.processed_dir is None:
+            processed_name = (
+                "processed"
+                if args.crop_size == 512
+                else f"processed_{args.crop_size}"
+            )
             train_processed_dir = os.path.join(
                 root,
-                "processed",
+                processed_name,
                 "train"
             )
             val_processed_dir = os.path.join(
                 root,
-                "processed",
+                processed_name,
                 "val"
             )
         else:
@@ -1183,7 +1185,7 @@ def main():
 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--crop_size", type=int, default=512)
+    parser.add_argument("--crop_size", type=int, default=1024)
 
     parser.add_argument(
         "--pre_cropped",
@@ -1300,39 +1302,65 @@ def main():
         "--rmp_num_paths",
         type=int,
         default=4,
-        help="residual multi-path VSS 的路径数量"
+        choices=[4],
+        help="residual multi-path VSS 固定使用四条互补路径"
     )
 
     parser.add_argument(
-        "--use_gia",
+        "--rmp_window_size",
+        type=int,
+        default=8,
+        help="局部窗口 Cross VSS 的特征图窗口大小"
+    )
+
+    parser.add_argument(
+        "--rmp_atrous_rate",
+        type=int,
+        default=2,
+        help="Atrous Cross VSS 的空间采样率"
+    )
+
+    parser.add_argument(
+        "--use_cluster_gcn",
         action="store_true",
         default=False,
-        help="启用 graph interaction attention"
+        help="启用四尺度硬聚类区域图卷积（MS-CGC，无注意力）"
     )
 
     parser.add_argument(
-        "--gia_dim",
+        "--cluster_counts",
+        type=int,
+        nargs=4,
+        default=[256, 128, 64, 32],
+        metavar=("S1", "S2", "S3", "S4"),
+        help="S1-S4 的区域聚类节点数"
+    )
+
+    parser.add_argument(
+        "--cluster_graph_dim",
         type=int,
         default=64,
-        help="graph interaction attention 的节点维度"
+        help="MS-CGC 区域节点特征维度"
     )
 
     parser.add_argument(
-        "--gia_heads",
+        "--cluster_iters",
         type=int,
-        default=4,
-        help="graph interaction attention 的 attention heads"
+        default=2,
+        help="每个尺度的硬聚类迭代次数"
     )
 
     parser.add_argument(
-        "--skip_mode",
-        type=str,
-        default="encoder",
-        choices=["ssam", "basic", "encoder"],
-        help="skip connection mode: ssam, basic, or encoder"
+        "--cluster_spatial_weight",
+        type=float,
+        default=0.5,
+        help="硬聚类描述子中的归一化坐标权重"
     )
 
     args = parser.parse_args()
+    args.rmp_scan_layout = RMP_SCAN_LAYOUT
+    args.decoder_layout = DECODER_LAYOUT
+    args.cluster_graph_layout = CLUSTER_GRAPH_LAYOUT
 
     device = setup_distributed(args)
     set_seed(args.seed, get_rank())
@@ -1415,10 +1443,13 @@ def main():
         topology_pairs=topology_pairs,
         use_rmp_vss=args.use_rmp_vss,
         rmp_num_paths=args.rmp_num_paths,
-        use_gia=args.use_gia,
-        gia_dim=args.gia_dim,
-        gia_heads=args.gia_heads,
-        skip_mode=args.skip_mode,
+        rmp_window_size=args.rmp_window_size,
+        rmp_atrous_rate=args.rmp_atrous_rate,
+        use_cluster_gcn=args.use_cluster_gcn,
+        cluster_counts=args.cluster_counts,
+        cluster_graph_dim=args.cluster_graph_dim,
+        cluster_iters=args.cluster_iters,
+        cluster_spatial_weight=args.cluster_spatial_weight,
     )
 
     if args.pretrain_resnet18:
@@ -1505,6 +1536,62 @@ def main():
             args.resume,
             map_location=map_location
         )
+
+        checkpoint_state = (
+            checkpoint.get("model", checkpoint)
+            if isinstance(checkpoint, dict)
+            else checkpoint
+        )
+        checkpoint_args = (
+            checkpoint.get("args", {})
+            if isinstance(checkpoint, dict)
+            else {}
+        )
+        if checkpoint_args.get("use_gia", False) or any(
+            key.replace("module.", "").startswith("graph_interaction.")
+            for key in checkpoint_state
+        ):
+            raise RuntimeError(
+                "The resume checkpoint contains the removed GIA attention "
+                "path and cannot be loaded by the MS-CGC model."
+            )
+
+        if args.use_rmp_vss and isinstance(checkpoint, dict):
+            saved_args = checkpoint.get("args", {})
+            saved_uses_rmp = saved_args.get("use_rmp_vss", False)
+            saved_layout = saved_args.get("rmp_scan_layout")
+
+            if saved_uses_rmp and saved_layout != RMP_SCAN_LAYOUT:
+                raise RuntimeError(
+                    "The checkpoint uses the legacy multi-path VSS layout and "
+                    "cannot be resumed as global/local/diagonal/atrous VSS. "
+                    "Start a new training run."
+                )
+
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            saved_args = checkpoint.get("args", {})
+            saved_decoder_layout = saved_args.get("decoder_layout")
+            if saved_decoder_layout != DECODER_LAYOUT:
+                raise RuntimeError(
+                    "The checkpoint uses an incompatible decoder layout: "
+                    f"checkpoint={saved_decoder_layout!r}, "
+                    f"current={DECODER_LAYOUT!r}. Start a new training run."
+                )
+
+            saved_uses_cluster_gcn = saved_args.get(
+                "use_cluster_gcn",
+                False,
+            )
+            saved_cluster_layout = saved_args.get("cluster_graph_layout")
+            if (
+                saved_uses_cluster_gcn
+                and saved_cluster_layout != CLUSTER_GRAPH_LAYOUT
+            ):
+                raise RuntimeError(
+                    "The checkpoint uses an incompatible cluster graph layout: "
+                    f"checkpoint={saved_cluster_layout!r}, "
+                    f"current={CLUSTER_GRAPH_LAYOUT!r}."
+                )
 
         raw_model = get_raw_model(model)
 

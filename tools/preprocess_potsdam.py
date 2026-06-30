@@ -19,15 +19,15 @@ DATASET_ROOT = "/data/BUAS/HJK/TopoMamba/data/Potsdam"
 IMG_DIR = os.path.join(DATASET_ROOT, "Images")
 LABEL_DIR = os.path.join(DATASET_ROOT, "Labels")
 
-OUT_ROOT = os.path.join(DATASET_ROOT, "processed")
+OUT_ROOT = os.path.join(DATASET_ROOT, "processed_1024")
 
-CROP_SIZE = 512
+CROP_SIZE = 1024
 
 # 训练集建议用重叠切块，增加样本量和边界上下文
-TRAIN_STRIDE = 256
+TRAIN_STRIDE = 512
 
 # 验证集建议不用太多重叠，避免验证集样本过多
-VAL_STRIDE = 512
+VAL_STRIDE = 1024
 
 # 按大图划分 train / val，避免同一张大图的 patch 同时出现在 train 和 val
 VAL_RATIO = 0.2

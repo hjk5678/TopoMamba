@@ -1,143 +1,201 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _make_gaussian_kernel(kernel_size: int, sigma: float) -> torch.Tensor:
-    """生成一个二维高斯核（用于构建 LoG）。"""
-    ax = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
-    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
-    return kernel / kernel.sum()
+def make_group_norm(num_channels, max_groups=32):
+    groups = min(max_groups, num_channels)
+    while num_channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, num_channels)
 
 
 def _make_log_kernel(kernel_size: int, sigma: float) -> torch.Tensor:
-    """生成一个二维高斯拉普拉斯核。"""
+    """Generate a zero-mean 2D Laplacian-of-Gaussian kernel."""
     ax = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
-    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-    g = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
-    g = g / g.sum()
-    # 拉普拉斯：核中心为负，周围为正
-    laplace_kernel = (xx ** 2 + yy ** 2 - 2 * sigma ** 2) / (sigma ** 4)
-    log_kernel = laplace_kernel * g
-    # 归一化使核的总和为零（保持 DC 分量不变）
-    log_kernel = log_kernel - log_kernel.mean()
-    return log_kernel
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    gaussian = torch.exp(-(xx.square() + yy.square()) / (2.0 * sigma ** 2))
+    gaussian = gaussian / gaussian.sum()
+    laplacian = (xx.square() + yy.square() - 2.0 * sigma ** 2) / (sigma ** 4)
+    kernel = laplacian * gaussian
+    return kernel - kernel.mean()
 
 
 class BAUBlock(nn.Module):
     """
-    Boundary-Aware Upsample Block with LoG + Sobel edge priors.
+    Boundary-aware residual upsampling block.
 
-    Args:
-        in_channels: 输入特征通道数（上采样源）。
-        skip_channels: 跳跃特征通道数（来自 SSA‑M 的 G）。
-        out_channels: 输出特征通道数。
+    The skip feature is first projected into a learnable one-channel edge
+    source. Fixed Sobel and multi-scale LoG responses are normalized and fused
+    into a local boundary gate. The gate modulates the upsampled decoder feature
+    through a bounded residual scale initialized near zero, so flat regions are
+    not amplified by default.
     """
 
-    def __init__(self, in_channels, skip_channels, out_channels,
-                 log_sigmas=(1.0, 2.0, 4.0), kernel_size=7,
-                 use_sobel=True):
+    def __init__(
+        self,
+        in_channels,
+        skip_channels,
+        out_channels,
+        log_sigmas=(0.8, 1.2, 1.6),
+        kernel_size=7,
+        use_sobel=True,
+        max_boundary_gamma=0.5,
+        init_boundary_gamma=1e-3,
+    ):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+
+        if kernel_size % 2 == 0:
+            raise ValueError(f"LoG kernel_size must be odd, got {kernel_size}")
+        if len(log_sigmas) == 0:
+            raise ValueError("log_sigmas must contain at least one scale")
+        if max_boundary_gamma <= 0:
+            raise ValueError(
+                f"max_boundary_gamma must be positive, got {max_boundary_gamma}"
+            )
+
+        self.use_sobel = bool(use_sobel)
+        self.kernel_size = int(kernel_size)
+        self.max_boundary_gamma = float(max_boundary_gamma)
+
+        self.x_proj = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            make_group_norm(out_channels),
         )
-        self.use_sobel = use_sobel
+        self.skip_proj = nn.Sequential(
+            nn.Conv2d(skip_channels, out_channels, kernel_size=1, bias=False),
+            make_group_norm(out_channels),
+        )
 
-        # ---------- Sobel 核（固定） ----------
-        if use_sobel:
-            sobel_x = torch.tensor([[-1., 0., 1.],
-                                    [-2., 0., 2.],
-                                    [-1., 0., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
-            sobel_y = torch.tensor([[-1., -2., -1.],
-                                    [0., 0., 0.],
-                                    [1., 2., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
-            self.register_buffer('sobel_x', sobel_x)
-            self.register_buffer('sobel_y', sobel_y)
+        edge_hidden = max(8, min(32, skip_channels // 4))
+        self.edge_source = nn.Sequential(
+            nn.Conv2d(skip_channels, edge_hidden, kernel_size=1, bias=False),
+            make_group_norm(edge_hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(edge_hidden, 1, kernel_size=1, bias=True),
+        )
 
-        # ---------- 多尺度 LoG 核 ----------
-        self.log_sigmas = log_sigmas
-        self.n_log = len(log_sigmas)
-        log_kernels = []
-        for sigma in log_sigmas:
-            k = _make_log_kernel(kernel_size, sigma).float()
-            log_kernels.append(k.view(1, 1, kernel_size, kernel_size))
-        # 堆叠成 (n_log, 1, 1, ksize, ksize)，但 conv2d 只支持单输出通道，我们分别处理
-        self.log_kernels = nn.ParameterList([
-            nn.Parameter(k, requires_grad=False) for k in log_kernels
-        ])
-        # 可学习的尺度融合权重（初始化为相等）
-        self.log_weights = nn.Parameter(torch.ones(self.n_log) / self.n_log)
-        # 可学习的 Sobel 与 LoG 混合权重（初始偏向 Sobel 以保持稳定）
-        self.fuse_alpha = nn.Parameter(torch.tensor(0.8))  # Sobel 权重
-        self.fuse_beta = nn.Parameter(torch.tensor(0.2))  # LoG 权重
+        sobel_kernels = torch.tensor(
+            [
+                [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+                [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+                [[-2.0, -1.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 1.0, 2.0]],
+                [[0.0, -1.0, -2.0], [1.0, 0.0, -1.0], [2.0, 1.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        self.register_buffer("sobel_kernels", sobel_kernels)
 
-    def _extract_sobel_edge(self, x):
-        """x: (B, C, H, W) -> (B, 1, H, W) 多方向 Sobel 梯度幅值"""
-        if x.shape[1] > 1:
-            x = x.mean(dim=1, keepdim=True)
+        log_kernels = torch.stack(
+            [
+                _make_log_kernel(kernel_size, float(sigma))
+                for sigma in log_sigmas
+            ],
+            dim=0,
+        ).unsqueeze(1)
+        self.register_buffer("log_kernels", log_kernels)
 
-        # 定义四个方向的 Sobel 核（3x3）
-        sobel_0 = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3,
-                                                                                                                3)
-        sobel_90 = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=x.device).view(1, 1,
-                                                                                                                 3, 3)
-        sobel_45 = torch.tensor([[-2, -1, 0], [-1, 0, 1], [0, 1, 2]], dtype=torch.float32, device=x.device).view(1, 1,
-                                                                                                                 3, 3)
-        sobel_135 = torch.tensor([[0, -1, -2], [1, 0, -1], [2, 1, 0]], dtype=torch.float32, device=x.device).view(1, 1,
-                                                                                                                  3, 3)
+        self.log_scale_logits = nn.Parameter(torch.zeros(len(log_sigmas)))
+        self.edge_mix_logits = nn.Parameter(
+            torch.tensor([math.log(0.8), math.log(0.2)], dtype=torch.float32)
+        )
 
-        # 对每个方向做卷积，得到梯度分量
-        g0 = F.conv2d(x, sobel_0, padding=1)
-        g90 = F.conv2d(x, sobel_90, padding=1)
-        g45 = F.conv2d(x, sobel_45, padding=1)
-        g135 = F.conv2d(x, sobel_135, padding=1)
+        gate_hidden = max(8, out_channels // 8)
+        self.edge_gate = nn.Sequential(
+            nn.Conv2d(1, gate_hidden, kernel_size=3, padding=1, bias=False),
+            make_group_norm(gate_hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(gate_hidden, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
 
-        # 合成边缘强度（平方和的平方根，类似 Canny）
-        E = torch.sqrt(g0 ** 2 + g90 ** 2 + g45 ** 2 + g135 ** 2 + 1e-8)
-        return E
+        self.fuse = nn.Sequential(
+            nn.Conv2d(
+                out_channels * 2,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            make_group_norm(out_channels),
+            nn.GELU(),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            make_group_norm(out_channels),
+        )
+        self.out_act = nn.GELU()
 
-    def _extract_log_edge(self, x):
-        """x: (B, C, H, W) -> (B, 1, H, W) 多尺度 LoG 响应融合。"""
-        if x.shape[1] > 1:
-            x = x.mean(dim=1, keepdim=True)
-        responses = []
-        for idx, kernel in enumerate(self.log_kernels):
-            # 对每个通道分别卷积后求和（因为输入为 1 通道）
-            resp = F.conv2d(x, kernel, padding=kernel.shape[-1] // 2)
-            responses.append(resp.abs())  # 取绝对值作为边缘强度
-        # 加权融合（log_weights 经过 softmax 保证和为 1）
-        w = torch.softmax(self.log_weights, dim=0)
-        E_log = sum(w[i] * responses[i] for i in range(self.n_log))
-        return E_log
+        init_ratio = init_boundary_gamma / self.max_boundary_gamma
+        init_ratio = max(min(init_ratio, 0.999), -0.999)
+        init_raw = torch.atanh(torch.tensor(init_ratio, dtype=torch.float32))
+        self.boundary_gamma_raw = nn.Parameter(init_raw.view(1))
 
-    def forward(self, x, G):
-        # 1. 上采样
+    @staticmethod
+    def _normalize_response(edge):
+        edge_min = edge.amin(dim=(2, 3), keepdim=True)
+        edge_max = edge.amax(dim=(2, 3), keepdim=True)
+        return (edge - edge_min) / (edge_max - edge_min + 1e-6)
+
+    def _extract_sobel_edge(self, source):
+        if not self.use_sobel:
+            return torch.zeros_like(source)
+
+        source = F.pad(source, (1, 1, 1, 1), mode="replicate")
+        responses = F.conv2d(source, self.sobel_kernels)
+        edge = torch.sqrt(responses.square().mean(dim=1, keepdim=True) + 1e-12)
+        return self._normalize_response(edge)
+
+    def _extract_log_edge(self, source):
+        padding = self.kernel_size // 2
+        source = F.pad(
+            source,
+            (padding, padding, padding, padding),
+            mode="replicate",
+        )
+        responses = F.conv2d(source, self.log_kernels).abs()
+        weights = torch.softmax(self.log_scale_logits, dim=0)
+        edge = (responses * weights.view(1, -1, 1, 1)).sum(
+            dim=1,
+            keepdim=True,
+        )
+        return self._normalize_response(edge)
+
+    def forward(self, x, skip):
         x_up = F.interpolate(
             x,
-            size=G.shape[-2:],
-            mode='bilinear',
-            align_corners=True
-        )  # (B, C, H, W)
+            size=skip.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
 
-        # 2. 提取边缘先验（Sobel + LoG）
-        E_sobel = self._extract_sobel_edge(G)  # (B, 1, H, W)
-        E_log = self._extract_log_edge(G)  # (B, 1, H, W)
+        x_feat = self.x_proj(x_up)
+        skip_feat = self.skip_proj(skip)
 
-        # 融合两种先验（通过可学习权重）
-        alpha = torch.sigmoid(self.fuse_alpha)
-        beta = torch.sigmoid(self.fuse_beta)
-        E_fused = alpha * E_sobel + beta * E_log
+        edge_source = torch.nan_to_num(
+            self.edge_source(skip),
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        )
+        sobel_edge = self._extract_sobel_edge(edge_source)
+        log_edge = self._extract_log_edge(edge_source)
+        mix = torch.softmax(self.edge_mix_logits, dim=0)
+        fixed_edge = mix[0] * sobel_edge + mix[1] * log_edge
 
-        # 归一化到 [0,1] 并作为增强系数
-        E_fused = torch.sigmoid(E_fused)  # (B, 1, H, W)
+        gate = self.edge_gate(fixed_edge)
 
-        # 3. 边界感知增强
-        x_edge = x_up * (1.0 + E_fused)
+        boundary_gamma = (
+            torch.tanh(self.boundary_gamma_raw) * self.max_boundary_gamma
+        )
+        x_guided = x_feat + boundary_gamma * gate * x_feat
 
-        # 4. 与跳跃特征融合
-        out = torch.cat([x_edge, G], dim=1)
-        return self.conv(out)
+        base = x_feat + skip_feat
+        delta = self.fuse(torch.cat([x_guided, skip_feat], dim=1))
+        return self.out_act(base + delta)

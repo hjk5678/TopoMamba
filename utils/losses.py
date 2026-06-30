@@ -23,6 +23,33 @@ def _valid_mask_from_label(label, ignore_index=255):
     return (label != ignore_index).unsqueeze(1).float()
 
 
+def downsample_binary_max(binary_map, size):
+    """Preserve sparse positive boundary pixels when reducing resolution."""
+    if binary_map.shape[-2:] == size:
+        return binary_map
+
+    in_h, in_w = binary_map.shape[-2:]
+    out_h, out_w = size
+    if out_h <= in_h and out_w <= in_w:
+        return F.adaptive_max_pool2d(binary_map, output_size=size)
+
+    return F.interpolate(binary_map, size=size, mode="nearest")
+
+
+def downsample_valid_mask(valid_mask, size):
+    """A low-resolution location is valid only when its source region is valid."""
+    if valid_mask.shape[-2:] == size:
+        return valid_mask
+
+    in_h, in_w = valid_mask.shape[-2:]
+    out_h, out_w = size
+    if out_h <= in_h and out_w <= in_w:
+        pooled = F.adaptive_avg_pool2d(valid_mask, output_size=size)
+        return (pooled >= 1.0 - 1e-6).float()
+
+    return F.interpolate(valid_mask, size=size, mode="nearest")
+
+
 def downsample_label_nearest(label, size):
     """
     label: [B, H, W]
@@ -422,7 +449,8 @@ class TopoMambaLoss(nn.Module):
         ignore_index=255,
         class_weights=None,
         topology_pairs=None,
-        conn_scale_weights=None
+        conn_scale_weights=None,
+        edge_scale_weights=None,
     ):
         super().__init__()
 
@@ -442,6 +470,17 @@ class TopoMambaLoss(nn.Module):
             conn_scale_weights = [0.4, 0.3, 0.2, 0.1]
 
         self.conn_scale_weights = conn_scale_weights
+
+        if edge_scale_weights is None:
+            # Decoder edge predictions are ordered from coarse to fine.
+            edge_scale_weights = [0.1, 0.2, 0.3, 0.4]
+
+        if any(float(w) < 0 for w in edge_scale_weights):
+            raise ValueError("edge_scale_weights must be non-negative")
+        if sum(float(w) for w in edge_scale_weights) <= 0:
+            raise ValueError("edge_scale_weights must have a positive sum")
+
+        self.edge_scale_weights = edge_scale_weights
 
         if class_weights is not None:
             if len(class_weights) != num_classes:
@@ -603,36 +642,53 @@ class TopoMambaLoss(nn.Module):
             else:
                 edge_preds_list = list(edge_preds)
 
+            valid_edge_preds = [
+                edge_logit
+                for edge_logit in edge_preds_list
+                if edge_logit is not None
+            ]
+
+            if len(self.edge_scale_weights) == len(valid_edge_preds):
+                edge_weights = [float(w) for w in self.edge_scale_weights]
+            elif len(valid_edge_preds) > 0:
+                edge_weights = [1.0 / len(valid_edge_preds)] * len(valid_edge_preds)
+            else:
+                edge_weights = []
+
+            weight_sum = max(sum(edge_weights), 1e-12)
+            edge_weights = [w / weight_sum for w in edge_weights]
             edge_losses = []
 
-            for edge_logit in edge_preds_list:
-                if edge_logit is None:
-                    continue
-
+            for weight, edge_logit in zip(edge_weights, valid_edge_preds):
                 if edge_logit.dim() == 3:
                     edge_logit = edge_logit.unsqueeze(1)
 
-                edge_logit = _resize_like(
-                    edge_logit,
-                    target.shape[-2:]
+                target_hw = edge_logit.shape[-2:]
+                edge_gt_i = downsample_binary_max(
+                    edge_gt,
+                    size=target_hw,
+                )
+                valid_mask_i = downsample_valid_mask(
+                    valid_mask,
+                    size=target_hw,
                 )
 
                 bce_edge = masked_bce_with_logits(
                     edge_logit,
-                    edge_gt,
-                    valid_mask=valid_mask
+                    edge_gt_i,
+                    valid_mask=valid_mask_i,
                 )
 
                 dice_edge = binary_dice_loss_with_logits(
                     edge_logit,
-                    edge_gt,
-                    valid_mask=valid_mask
+                    edge_gt_i,
+                    valid_mask=valid_mask_i,
                 )
 
-                edge_losses.append(bce_edge + dice_edge)
+                edge_losses.append(weight * (bce_edge + dice_edge))
 
             if len(edge_losses) > 0:
-                edge_loss = sum(edge_losses) / len(edge_losses)
+                edge_loss = sum(edge_losses)
 
         # ----------------------------------------------------
         # 3. Multi-scale mstc
